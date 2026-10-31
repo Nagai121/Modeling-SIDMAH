@@ -4,7 +4,7 @@
 Tripoの通信、APIキー管理、ポーリング、課金処理、ファイルダウンロードをModeling SIDMAH内で実装しません。既に使えるTripo公式CLI/MCPまたは接続済みブラウザ操作ツールを使用します。ツールが利用できないときは作業を実行できない旨を記録します。存在しないツールや生成結果を捏造しません。
 
 ## 三面図と候補
-Directorが指定した部位についてfront / side / backの画像を用い、Tripoのfront / left / back / right入力に対応させます。`modeling/reference_images/manifest.json`のsideの向きを必ず確認します。候補を複数生成して比較し、task_id、使用パラメータ、参照画像とプレビュー、出力ファイルを記録します。きゃらくるにある頭部・身体それぞれ4候補生成の方式を参考にできますが、作成数はAssignmentの条件に従います。
+Directorが指定した部位について与えられた方向の画像を利用します。既存Tripo CLI/MCPの利用可能な入力方式に合わせ、未入力の画像を要求しません。sideの向きが明示されていない場合、左右を決めつけません。候補を複数生成して比較し、task_id、使用パラメータ、参照画像とプレビュー、出力ファイルを記録します。きゃらくるにある頭部・身体それぞれ4候補生成の方式を参考にできますが、作成数はAssignmentの条件に従います。
 
 ## 公式一次資料
 - https://github.com/Tripo-Developer/Tripo3D-Plugin-dsh/blob/master/plugin/skills/tripo-3d/SKILL.md

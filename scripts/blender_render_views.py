@@ -16,6 +16,9 @@ parser.add_argument("--output", type=Path, required=True)
 parser.add_argument("--side", choices=("left", "right"), default=None)
 parser.add_argument("--manifest", type=Path, default=Path("modeling/reference_images/manifest.json"))
 parser.add_argument("--resolution", type=int, default=1024)
+parser.add_argument("--ortho-scale", type=float, default=None, help="Fixed shared orthographic scale for comparisons")
+parser.add_argument("--camera-center", type=float, nargs=3, default=None, metavar=("X","Y","Z"),
+                    help="Fixed shared camera center for comparisons")
 args = parser.parse_args(argv)
 
 from mathutils import Vector
@@ -26,7 +29,7 @@ if side is None:
     if not args.manifest.is_file():
         raise SystemExit("Reference manifest not found; specify --side left|right explicitly")
     side = json.loads(args.manifest.read_text(encoding="utf-8")).get("side")
-if side not in ("left", "right"):
+if side not in (None, "left", "right"):
     raise SystemExit("Invalid side direction")
 if args.resolution < 32:
     raise SystemExit("Resolution must be at least 32")
@@ -52,9 +55,19 @@ if not meshes:
 corners = [obj.matrix_world @ Vector(corner) for obj in meshes for corner in obj.bound_box]
 lower = Vector(tuple(min(v[i] for v in corners) for i in range(3)))
 upper = Vector(tuple(max(v[i] for v in corners) for i in range(3)))
-center = (lower + upper) / 2
 extent = upper - lower
-camera_scale = max(extent.x, extent.y, extent.z, 0.0001) * 1.15
+if (args.ortho_scale is None) != (args.camera_center is None):
+    raise SystemExit("Comparison rendering requires BOTH --ortho-scale and --camera-center")
+if args.ortho_scale is not None and args.ortho_scale <= 0:
+    raise SystemExit("--ortho-scale must be positive")
+if args.ortho_scale is not None:
+    # Use the exact same scale and center for every compared candidate.
+    center = Vector(args.camera_center)
+    camera_scale = args.ortho_scale
+else:
+    center = (lower + upper) / 2
+    camera_scale = max(extent.x, extent.y, extent.z, 0.0001) * 1.15
+    print("WARNING: model-dependent framing; do not compare sizes unless --ortho-scale and --camera-center are shared")
 
 scene = bpy.context.scene
 scene.render.engine = "BLENDER_EEVEE_NEXT"
@@ -87,7 +100,9 @@ scene.collection.objects.link(camera)
 scene.camera = camera
 camera_data.type = "ORTHO"
 camera_data.ortho_scale = camera_scale
-views = (("front", (0, -1, 0)), ("side", (1 if side == "right" else -1, 0, 0)), ("back", (0, 1, 0)))
+views = [("front", (0, -1, 0)), ("back", (0, 1, 0))]
+if side is not None:
+    views.insert(1, ("side", (1 if side == "right" else -1, 0, 0)))
 for name, axis in views:
     camera.location = center + Vector(axis) * max(4.0, camera_scale * 3)
     camera.rotation_euler = (center - camera.location).to_track_quat("-Z", "Y").to_euler()

@@ -4,12 +4,11 @@ works/
 session/
 shared_databases/
 modeling/tripo_tasks/
-modeling/reference_images/head/
-modeling/reference_images/upper_body/
-modeling/reference_images/lower_body/
-modeling/reference_images/accessories/
-modeling/reference_images/whole/
 *.blend1
 *.blend2
 __pycache__/
 .DS_Store
+
+# Keep reference-slot directories in git while leaving user images untracked.
+modeling/reference_images/*/*
+!modeling/reference_images/*/.gitkeep
