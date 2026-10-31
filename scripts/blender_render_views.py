@@ -25,9 +25,7 @@ from mathutils import Vector
 import bpy
 
 side = args.side
-if side is None:
-    if not args.manifest.is_file():
-        raise SystemExit("Reference manifest not found; specify --side left|right explicitly")
+if side is None and args.manifest.is_file():
     side = json.loads(args.manifest.read_text(encoding="utf-8")).get("side")
 if side not in (None, "left", "right"):
     raise SystemExit("Invalid side direction")
@@ -101,8 +99,11 @@ scene.camera = camera
 camera_data.type = "ORTHO"
 camera_data.ortho_scale = camera_scale
 views = [("front", (0, -1, 0)), ("back", (0, 1, 0))]
-if side is not None:
-    views.insert(1, ("side", (1 if side == "right" else -1, 0, 0)))
+if side is None:
+    # Unknown reference side: render BOTH, then Director decides which matches.
+    views.extend([("side_left", (-1, 0, 0)), ("side_right", (1, 0, 0))])
+else:
+    views.append(("side", (1 if side == "right" else -1, 0, 0)))
 for name, axis in views:
     camera.location = center + Vector(axis) * max(4.0, camera_scale * 3)
     camera.rotation_euler = (center - camera.location).to_track_quat("-Z", "Y").to_euler()

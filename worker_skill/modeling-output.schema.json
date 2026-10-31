@@ -4,13 +4,14 @@
   "type": "object",
   "required": [
     "schemaVersion",
+    "startId",
     "primaryModel",
     "previewImages",
     "otherFiles"
   ],
   "properties": {
     "schemaVersion": {
-      "const": 1
+      "const": 2
     },
     "primaryModel": {
       "type": "string",
@@ -34,6 +35,10 @@
     },
     "notes": {
       "type": "string"
+    },
+    "startId": {
+      "type": "string",
+      "format": "uuid"
     }
   },
   "additionalProperties": false

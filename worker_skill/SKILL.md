@@ -1,12 +1,7 @@
-# Worker — Modeling SIDMAH v0.1.1
+# Worker — Modeling SIDMAH v0.1.2
 
-所属CellのAssignmentを一件ずつ受領します。識別子はManagerが発行するものだけを利用します。
-
-1. 初回はbootstrapで受け取った`assignmentId`を使い`accept_cell_assignment`を呼びます。
-2. Start通知を受けたら`worker_skill/worker.md`と必要な`worker_skill/skills/*/SKILL.md`を読み、現在のCellのWork Placeで指定された部位または統合作業を行います。
-3. 実際の3Dモデルと必要なプレビュー画像を保存し、Work Place直下に`modeling-result.json`を置きます。実体が検査可能なファイルを列挙して`submit_modeling_work`を呼びます。
-4. Result通知を受け取ったら固定済み成果物を監査し、制作物・画像との差異・確認方法・未達・修正案を`create_end_assignment`に提出します。
-5. 次のStart通知なしに新規Runtimeを作成しません。`get_pending_deliveries`は配送確認であり、それ自体は作業開始を意味しません。
-
-外部課金はDirectorが認めた範囲だけで行い、失敗や未検証を成功として報告しません。
-
+1. Bootstrapに従って`accept_cell_assignment`で受領し、現在のStartを1件だけ処理する。
+2. `worker_skill/worker.md`、`worker_skill/skills/blender-modeling/SKILL.md`を必ず読む。比較する作業では`visual-review`も使う。
+3. **Blender（`bpy`/CLIまたは既存のBlender MCP）で3D形状を新規制作する。** Tripo/外部3Dモデル生成サービスは利用しない。
+4. `works/cell_<n>/work_place/`でモデルを保存し、`modeling-result.json`へ**現Startの`startId`**・モデル・プレビュー・依存ファイルを列挙して`submit_modeling_work`する。
+5. Resultを監査し、観測結果・差異・残課題を`create_end_assignment`で返す。次のStart通知なしに新Runtimeを開始しない。

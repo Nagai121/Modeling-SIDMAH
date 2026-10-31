@@ -4,7 +4,8 @@ import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { invariant } from "../core/errors.ts";
 
 export type ModelingDeclaration = {
-  schemaVersion: 1;
+  schemaVersion: 2;
+  startId: string;
   primaryModel: string;
   previewImages: string[];
   otherFiles: string[];
@@ -127,17 +128,22 @@ function validateModel(file: string, root: string, relativeName: string, declare
   }
 }
 
-export function validateModelingOutput(folder: string): ModelingDeclaration {
+export function validateModelingOutput(folder: string, expectedStartId?: string): ModelingDeclaration {
   const resultPath = safeArtifactPath(folder, "modeling-result.json");
   const result: unknown = JSON.parse(readFileSync(resultPath,"utf8"));
   invariant(!!result && typeof result === "object" && !Array.isArray(result),
     "MODEL_RESULT_INVALID","Invalid modeling-result.json");
   const r=result as Record<string,unknown>;
-  invariant(r.schemaVersion === 1 && typeof r.primaryModel === "string" &&
+  invariant(r.schemaVersion === 2 && typeof r.startId === "string" &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(r.startId) &&
+    typeof r.primaryModel === "string" &&
     Array.isArray(r.previewImages) && Array.isArray(r.otherFiles) &&
     [...r.previewImages,...r.otherFiles].every(v=>typeof v==="string") &&
     (r.notes === undefined || typeof r.notes === "string"),
     "MODEL_RESULT_INVALID","Modeling result fields are invalid");
+  if (expectedStartId !== undefined)
+    invariant(r.startId === expectedStartId, "MODEL_START_MISMATCH",
+      "Work Place contains a model from another Start Assignment");
   const all=[r.primaryModel as string,...r.previewImages as string[],...r.otherFiles as string[]];
   invariant(new Set(all).size === all.length,"MODEL_PATH_DUPLICATE","Duplicate paths in modeling-result.json");
   for(const p of all) safeArtifactPath(folder,p);

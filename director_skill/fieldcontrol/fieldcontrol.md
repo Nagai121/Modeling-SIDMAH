@@ -1,10 +1,7 @@
-# Field Control — Modeling
+# Field Control — Modeling SIDMAH
 
-Gate 1（詳細: `system_fc.md`）：Codex/OpenCodeのMCP、Manager、Director、Cell、Binding、fenceが正常であることを検査する。
+Gate 1: 元SIDMAHのDirector・Worker・Cell・MCP・Binding・fence等の制御経路を確認。
+Gate 2: Runtime・Start/Result/End配送・既存SQLite・復旧経路を確認。**仮モデル・仮Assignmentは作成しない**。
+Gate 3: 最低1枚の参照画像へのアクセス、Blenderの実行環境（`blender --background --factory-startup --python-expr "import bpy; print(bpy.app.version_string)"`等）、`bpy`を用いた新規メッシュ制作と編集が可能なツール経路、レンダリング・比較の手段を確認。MCPプラグインの存在は必須ではなく、Blender CLIがあればよい。
 
-Gate 2（詳細: `system_fc.md`）：実行管理・配送・状態機械・復旧の制御経路を既存の管理情報とツールから確認する。仮モデルや仮の制作タスクを作らない。
-
-Gate 3（詳細: `modeling_fc.md`）：実際に入力された1枚以上の試料画像の形式・判明している向き・部位、既存Tripo等の生成ツール経路、Blenderでの編集・三方向レンダリング、半透明重ね合わせ、成果物の出所を検証する。課金が生じる操作は承認された範囲だけで実行する。
-
-失敗・未検証のGateを合格とみなさない。確認内容、検査証拠、障害、再試行理由を記録する。旧実験用Simulatorは使用しない。
-
+FCは制御・環境の確認であり、架空の制作作業はしない。使えない環境を合格と報告しない。外部3D生成サービスの利用をFCに含めない。

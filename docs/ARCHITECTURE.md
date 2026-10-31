@@ -1,20 +1,15 @@
-# Modeling SIDMAH v0.1.1 — Architecture
+# Modeling SIDMAH v0.1.2
 
-## 継承するハーネス
-元SIDMAH main `a85f66f`のDirector/Worker/Cell/Binding/Assignment/Runtime/Result/End/配送・復旧・SQL RAGを継承します。Workerの起動はDirectorが行い、Managerは受領・配送・状態を保持します。
+元SIDMAHのDirector・Worker・Cell・Binding・Assignment・Runtime・Result・End・SQLite・配送・復旧を継承した、**Blenderによる独立した3Dモデリングハーネス**。Tripo/外部生成APIを使わない。
 
-## 入力と品質目標
-5区分（頭部、上半身［衣服込み］、下半身［衣服込み］、小物、全体）×3方向（正面、側面、背面）の15枠のうち、入力は最低1枚。側面方向・Cell数は固定しません。Director自身が部位と全体の両方を視認比較して完全一致を目指します。許容誤差・反復回数は一律の固定値を設けません。
+## 入力
+5区分×3方向の15枠は分類スキーマ。入力1枚から開始。合成画像・未分類画像も`modeling/reference_images/inbox/`に登録でき、Directorが画像内の視点を認識する。入力ファイルはMCP`register_reference_image`（読み取り可能なパスまたはbase64）で受領し、`list_reference_images`で列挙できる。
 
 ## 制作
-Workerは既存Tripo CLI/MCPやBlenderの操作ツールで制作します。Tripo側の生成実装は複製しません。三面図との位置合わせ、複数候補比較、局所修正、テクスチャ、リギングは対応する専門Skillsに従います。きゃらくるの候補比較・透明重ね合わせの工程を参照します。
+Directorが画像を理解→FC→Blenderで全体モデル新規造形→視覚比較→必要な部分だけ分離・編集→再評価。Workerは`bpy`・Blender CLI・利用可能ならBlender MCPで作る。モデル生成済みのアセットやTripoを前提にしない。FCはMCP・制御とBlender実行環境を確認するだけで、仮制作を行わない。
 
-## Runtime
-WorkerがWork Placeに`modeling-result.json`と成果物を用意した後、`submit_modeling_work`がSnapshotを固定し、指定された成果物を`works/cell_<n>/runtime_<m>/artifacts/`へ保存します。SHA-256付きのResultを固定し、既存のEnd→Director Reviewに配送します。Simulatorのコマンド実行は行いません。
+## 成果物と安全性
+Workerの`modeling-result.json`はschemaVersion 2、現在の`startId`、メッシュやプレビュー・依存ファイルを列挙する。Start IDを突き合わせて前のWork Placeの誤提出を防止する。Snapshotと固定成果物のSHA-256を検査し、Result/Endを返す。`commit_failed`を含めてリカバリする。
 
-## DBと互換性
-Cell・Runtime・統合SQLiteの分割を維持し、各DBの`harness_identity`で別ハーネスを区別します。`modeling_sidmah`・スキーマ版1の外部統合DBだけを同一ハーネスの共有検索に使用します。
-
-## 実験固有の部分
-Simulator配置と実験用コマンドパイプラインは削除しました。Field ControlのGate 1と2は制御経路のチェックとして継承し、Gate 2では仮モデルを作らず制御経路を検査します。Gate 3は実際の入力画像・モデリング工程の検証に変更します。
-
+## 品質と検証
+Directorが実際の画像とレンダリングを照合する。入力にない視点を必須にしない。自動的な完全一致の保証はできない。単体のCIはハーネス制御を検証し、Blender実動作は別途検証する。

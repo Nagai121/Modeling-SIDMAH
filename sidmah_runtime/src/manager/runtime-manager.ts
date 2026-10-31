@@ -234,7 +234,7 @@ export class RuntimeManager {
     const runtimeDir = this.runtimeDirectory(start);
     const snapshot = resolve(runtimeDir, `snapshot-${start.runtime_no}`);
     mkdirSync(runtimeDir, { recursive: true });
-    validateModelingOutput(workPlace);
+    validateModelingOutput(workPlace, startId);
     let current = this.db.prepare("SELECT * FROM runtimes WHERE runtime_id=?").get(runtime.runtime_id) as any;
     let temporary = ["commit_failed", "commit_pending"].includes(current.snapshot_state) ? current.snapshot_temporary_path : undefined;
     const sourceManifest = this.treeManifest(workPlace);
@@ -251,7 +251,7 @@ export class RuntimeManager {
         throw error;
       }
     }
-    validateModelingOutput(temporary);
+    validateModelingOutput(temporary, startId);
     const destinationContentHash = this.manifestContentHash(this.treeManifest(temporary));
     const currentContentHash = this.manifestContentHash(this.treeManifest(workPlace));
     invariant(sourceContentHash === destinationContentHash && sourceContentHash === currentContentHash,
@@ -291,7 +291,9 @@ export class RuntimeManager {
     if (!runtime || runtime.state === "finished") return;
     invariant(runtime.state === "launching", "MODELING_STATE_INVALID", "Runtime must be launching");
     const dir = this.runtimeDirectory(runtime), snapshot = resolve(dir, `snapshot-${runtime.runtime_no}`);
-    const declared = validateModelingOutput(snapshot);
+    const linkedStart = this.db.prepare("SELECT start_id FROM starts WHERE runtime_id=?").get(runtimeId) as any;
+    invariant(linkedStart?.start_id, "MODEL_START_NOT_FOUND", "Runtime is missing its Start");
+    const declared = validateModelingOutput(snapshot, linkedStart.start_id);
     const artifacts = [declared.primaryModel, ...declared.previewImages, ...declared.otherFiles];
     const copied: Array<{ path: string; sha256: string; bytes: number }> = [];
     for (const rel of artifacts) {
@@ -308,7 +310,7 @@ export class RuntimeManager {
       }
       copied.push({ path: rel, sha256, bytes: lstatSync(src).size });
     }
-    const result = { schemaVersion: 1, executionStatus: "success", type: "modeling",
+    const result = { schemaVersion: 2, startId: linkedStart.start_id, executionStatus: "success", type: "modeling",
       primaryModel: declared.primaryModel, previewImages: declared.previewImages,
       otherFiles: declared.otherFiles, notes: declared.notes ?? "", artifacts: copied };
     this.finishResult(runtimeId, () => ({
@@ -338,8 +340,9 @@ export class RuntimeManager {
       return;
     }
     const dir = this.runtimeDirectory(runtime);
+    const linkedStart = this.db.prepare("SELECT start_id FROM starts WHERE runtime_id=?").get(runtimeId) as any;
     const failure = {
-      schemaVersion: 1, type: "modeling", executionStatus: "failure", artifacts: [],
+      schemaVersion: 2, startId: linkedStart?.start_id, type: "modeling", executionStatus: "failure", artifacts: [],
       error: error instanceof Error ? error.message : String(error),
     };
     this.finishResult(runtimeId, () => ({
@@ -356,7 +359,12 @@ export class RuntimeManager {
       const body = readFileSync(resultRef, "utf8");
       const hash = createHash("sha256").update(body).digest("hex");
       const result = JSON.parse(body);
-      if (manifest.complete === true && manifest.runtimeId === runtime.runtime_id && manifest.resultHash === hash &&
+      const startRow = this.db.prepare("SELECT start_id FROM starts WHERE runtime_id=?").get(runtime.runtime_id) as any;
+      // Legacy v0.1.1 completed Result files have no embedded startId.
+      const legacy = result.schemaVersion === 1 && runtime.state === "finished" &&
+        runtime.result_hash === hash;
+      const belongsToStart = startRow?.start_id && (result.startId === startRow.start_id || legacy);
+      if (belongsToStart && manifest.complete === true && manifest.runtimeId === runtime.runtime_id && manifest.resultHash === hash &&
         verifyFixedArtifacts(dir, result)) {
         return { resultRef, resultHash: hash, manifestRef, executionStatus: String(result.executionStatus) };
       }
@@ -656,6 +664,11 @@ export class RuntimeManager {
         this.db.prepare("UPDATE runtimes SET snapshot_state='none',snapshot_temporary_path=NULL WHERE runtime_id=? AND state='created'").run(runtime.runtime_id);
         continue;
       }
+      if (runtime.snapshot_state === "none") {
+        // A snapshot without an atomic commit record is an orphan, never an accepted submission.
+        if (existsSync(snapshot)) this.removeSnapshot(snapshot);
+        continue;
+      }
       if (!existsSync(snapshot)) continue;
       try {
         if (runtime.snapshot_state === "commit_pending" || runtime.snapshot_state === "commit_failed") {
@@ -671,7 +684,7 @@ export class RuntimeManager {
           }
           invariant(matches, "SNAPSHOT_RECOVERY_MISMATCH", "Committed Snapshot does not match its recorded source");
         }
-        validateModelingOutput(snapshot);
+        validateModelingOutput(snapshot, runtime.start_id);
         this.freezeSnapshot(snapshot);
       } catch (error) {
         this.removeSnapshot(snapshot);
@@ -687,7 +700,7 @@ export class RuntimeManager {
       }
       const executorToken = randomUUID();
       const adopted = this.cells.withRecoverableWorkerItem(runtime.cell_no, "start", runtime.start_id, () => transaction(this.db, () => {
-        const changed = this.db.prepare("UPDATE runtimes SET state='launching',snapshot_state='fixed',executor_token=?,snapshot_failure_class=NULL,snapshot_diagnostics_json=NULL,state_version=state_version+1 WHERE runtime_id=? AND state='created' AND snapshot_state IN('none','commit_pending')").run(executorToken, runtime.runtime_id);
+        const changed = this.db.prepare("UPDATE runtimes SET state='launching',snapshot_state='fixed',executor_token=?,snapshot_failure_class=NULL,snapshot_diagnostics_json=NULL,state_version=state_version+1 WHERE runtime_id=? AND state='created' AND snapshot_state IN('commit_pending','commit_failed')").run(executorToken, runtime.runtime_id);
         if (changed.changes !== 1) return false;
         this.db.prepare("UPDATE starts SET state='completed' WHERE start_id=? AND state='inbox_registered'").run(runtime.start_id);
         return true;

@@ -1,10 +1,21 @@
-# Modeling Artifact Contract
+# Modeling artifact contract — schemaVersion 2
 
-`works/cell_<n>/work_place/modeling-result.json`に、`schemaVersion`=1、`primaryModel`、`previewImages`、`otherFiles`を記載します。例:
+Workerは現在のStart Assignmentの`startId`を提出マニフェストに書く必要があります。以前のStartから残ったモデルやマニフェストを流用してはいけません。
 
-`{"schemaVersion":1,"primaryModel":"out/model.glb","previewImages":["renders/front.png","renders/side.png","renders/back.png"],"otherFiles":["out/model.blend"],"notes":"head candidate 2"}`
+Work Place: `works/cell_<n>/work_place/modeling-result.json`
 
-列挙するパスはWork Placeからの相対パスで、実在する非空のファイルです。絶対パス、上位ディレクトリへの移動、シンボリックリンクを使いません。`primaryModel`はBlend/GLB/GLTF/FBX/OBJのいずれかです。`previewImages`はPNG/JPEG/WebPを指定します。
+例：
+```json
+{
+  "schemaVersion": 2,
+  "startId": "START_ASSIGNMENT_UUID_FROM_MANAGER",
+  "primaryModel": "out/model.blend",
+  "previewImages": ["renders/front.png"],
+  "otherFiles": ["create_model.py"],
+  "notes": "Created in Blender from references"
+}
+```
 
-`submit_modeling_work`はWork PlaceをSnapshotとして固定し、指定ファイルを`works/cell_<n>/runtime_<m>/artifacts/`へコピー、SHA-256を記録します。以降はWork Placeを別の作業で更新できます。Resultの監査では固定済みファイルを確認します。
+UUIDは例の文字列ではなくManagerが返した実値に置き換えます。全体モデルをBlenderで作成し、必要な部分だけを分離します。モデルとプレビューは非空である必要があり、GLTF/OBJで外部依存ファイルがあるときは必ず`otherFiles`に列挙します。絶対パス、上位パス、リンクは使用できません。
 
+`submit_modeling_work`はStart IDを照合してSnapshotを固定し、SHA-256付きResultを生成します。Resultの品質評価はDirectorが実施します。

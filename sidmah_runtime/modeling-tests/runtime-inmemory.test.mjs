@@ -54,7 +54,7 @@ async function start(testEnv){
   writeFileSync(join(work,"out","model.glb"),triangleGLB());
   writeFileSync(join(work,"renders","front.png"),PNG);
   writeFileSync(join(work,"modeling-result.json"),JSON.stringify({
-    schemaVersion:1,primaryModel:"out/model.glb",previewImages:["renders/front.png"],otherFiles:[],notes:"local fixture"
+    schemaVersion:2,startId:runtime.startId,primaryModel:"out/model.glb",previewImages:["renders/front.png"],otherFiles:[],notes:"local fixture"
   }));
   return {director,cell,worker,runtime,work};
 }
@@ -65,11 +65,11 @@ test("invalid GLB fails validation instead of being falsely accepted",()=>{
     mkdirSync(join(root,"out"));
     writeFileSync(join(root,"out","model.glb"),"not a valid GLB");
     writeFileSync(join(root,"modeling-result.json"),JSON.stringify({
-      schemaVersion:1,primaryModel:"out/model.glb",previewImages:[],otherFiles:[]
+      schemaVersion:2,startId:randomUUID(),primaryModel:"out/model.glb",previewImages:[],otherFiles:[]
     }));
     assert.throws(()=>validateModelingOutput(root),/MODEL_GEOMETRY_INVALID|GLB/);
     writeFileSync(join(root,"out","model.glb"),triangleGLB());
-    assert.equal(validateModelingOutput(root).schemaVersion,1);
+    assert.equal(validateModelingOutput(root).schemaVersion,2);
   } finally {rmSync(root,{recursive:true,force:true})}
 });
 
@@ -156,4 +156,55 @@ test("interrupted temporary copying returns to retryable created state",async()=
     assert.equal(row.state,"created");assert.equal(row.snapshot_state,"none");
     assert.equal(existsSync(tmp),false);
   } finally {e.close()}
+});
+
+test("a stale Work Place manifest cannot be submitted for a different Start",async()=>{
+  const e=setup();
+  try{
+    const {worker,runtime,work}=await start(e);
+    const manifest=JSON.parse(readFileSync(join(work,"modeling-result.json"),"utf8"));
+    const currentStart=manifest.startId;
+    manifest.startId=randomUUID();
+    writeFileSync(join(work,"modeling-result.json"),JSON.stringify(manifest));
+    await assert.rejects(()=>e.system.submitModelingWork(worker),/Work Place contains a model from another Start Assignment/);
+    const row=e.system.runtimes.db.prepare("SELECT state FROM runtimes WHERE runtime_id=?").get(runtime.runtimeId);
+    assert.equal(row.state,"created");
+    manifest.startId=currentStart;
+    writeFileSync(join(work,"modeling-result.json"),JSON.stringify(manifest));
+    const submitted=await e.system.submitModelingWork(worker);
+    assert.equal(submitted.executionStatus,"success");
+  }finally{e.close()}
+});
+
+test("commit_failed Snapshot can be adopted when its recorded content matches",async()=>{
+  const e=setup();
+  try{
+    const {cell,runtime,work}=await start(e);
+    const dir=join(e.root,"works","cell_"+cell.cellNo,"runtime_"+runtime.runtimeNo);
+    const snap=join(dir,"snapshot-"+runtime.runtimeNo);
+    mkdirSync(dir,{recursive:true});
+    cpSync(work,snap,{recursive:true});
+    const before=e.system.runtimes.treeManifest(snap);
+    e.system.runtimes.db.prepare("UPDATE runtimes SET snapshot_state='commit_failed',snapshot_diagnostics_json=?,snapshot_source_hash=?,snapshot_source_path=? WHERE runtime_id=?")
+      .run(JSON.stringify({manifest:before}),before.hash,work,runtime.runtimeId);
+    await e.system.runtimes.recover();
+    const row=e.system.runtimes.db.prepare("SELECT state,execution_status FROM runtimes WHERE runtime_id=?").get(runtime.runtimeId);
+    assert.equal(row.state,"finished");
+    assert.equal(row.execution_status,"success");
+  }finally{e.close()}
+});
+
+test("orphan Snapshot without commit record is never promoted to a successful Runtime",async()=>{
+  const e=setup();
+  try{
+    const {cell,runtime,work}=await start(e);
+    const dir=join(e.root,"works","cell_"+cell.cellNo,"runtime_"+runtime.runtimeNo);
+    const snap=join(dir,"snapshot-"+runtime.runtimeNo);
+    mkdirSync(dir,{recursive:true});cpSync(work,snap,{recursive:true});
+    await e.system.runtimes.recover();
+    const row=e.system.runtimes.db.prepare("SELECT state,snapshot_state FROM runtimes WHERE runtime_id=?").get(runtime.runtimeId);
+    assert.equal(row.state,"created");
+    assert.equal(row.snapshot_state,"none");
+    assert.equal(existsSync(snap),false);
+  }finally{e.close()}
 });
