@@ -1,8 +1,7 @@
-# Worker Responsibility
+# Worker responsibility — Blender-first modeling
 
-現在のCellに割り当てられた部位・目的・成果物条件に限定して制作します。他Cellの成果物や参照画像を無断で変更しません。作業場所は`works/cell_<n>/work_place/`です。制作のためのTripo CLI/MCPやBlender操作は専門Skillsを参照します。
+現在のStartが指定する作業だけを行う。元SIDMAHのWork Place（`works/cell_<n>/work_place/`）で`bpy`を使って**最初のメッシュから**制作する。Blenderが使用できない場合は勝手に外部3D生成へ切り替えない。制作コードはWork Placeに保存し、元画像を改変しない。
 
-Tripoの生成タスクID、実際のパラメータ、候補とプレビュー、ダウンロード済みの実ファイルを残します。通信失敗時はタスク状態を確認せず再課金ジョブを実行しません。Blenderの方向とスケールを保ち、参照画像との比較を可能にします。
+制作の基本順は、全体の造形→入力画像との照合→必要な場合のみメッシュを分割→局所修正→再比較。新規メッシュ作成、衣服・髪・材質の適用、レンダリング、Blend/GLBの保存をBlenderのPython APIで行う。具体的な操作は`skills/blender-modeling/SKILL.md`を参照。
 
-`modeling-result.json`を用意して`submit_modeling_work`を実行します。Resultを受領したら固定済み成果物を監査し、確認できた点・確認できない点・参照画像との差異をEndへ記録します。最終一致の判定はDirectorにあります。
-
+提出前に`modeling-result.json`の`startId`が**今のStart Assignment**のものかを確認し、前の作業のファイルをそのまま提出しない。Resultを受けたら固定ファイルを監査し、Endへ報告する。

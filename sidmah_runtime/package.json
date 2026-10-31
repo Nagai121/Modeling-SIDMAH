@@ -1,6 +1,6 @@
 {
   "name": "modeling-sidmah-runtime",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "private": true,
   "type": "module",
   "engines": {
@@ -9,7 +9,7 @@
   "scripts": {
     "start": "node --experimental-strip-types src/mcp/server.ts ..",
     "provider-event": "node --experimental-strip-types src/provider/events.ts",
-    "test": "node --experimental-strip-types --test modeling-tests/fixed-result.test.mjs modeling-tests/harness-identity.test.mjs modeling-tests/mcp-and-import.test.mjs modeling-tests/runtime-inmemory.test.mjs modeling-tests/artifacts.test.mjs",
+    "test": "node --experimental-strip-types --test modeling-tests/fixed-result.test.mjs modeling-tests/harness-identity.test.mjs modeling-tests/mcp-and-import.test.mjs modeling-tests/runtime-inmemory.test.mjs modeling-tests/artifacts.test.mjs modeling-tests/reference-input.test.mjs",
     "export-state": "node --experimental-strip-types src/maintenance/state-export.ts ..",
     "mcp-config-check": "node --experimental-strip-types src/maintenance/mcp-config-sync.ts .. check",
     "mcp-config-apply": "node --experimental-strip-types src/maintenance/mcp-config-sync.ts .. apply",

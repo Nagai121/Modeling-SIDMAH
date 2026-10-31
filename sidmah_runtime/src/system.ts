@@ -1,3 +1,4 @@
+import { listReferenceImages, registerReferenceImage } from "./runtime/reference-input.ts";
 import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import { invariant } from "./core/errors.ts";
@@ -67,6 +68,19 @@ export class SidmahSystem {
     const output = unregistered ? this.cells.claimPendingCellAssignment(context.providerSessionId, assignmentId) : (this.cells.acknowledgeCellAssignment(context.sessionToken, assignmentId), { ok: true });
     await this.pump(); return output;
   }
+  listReferenceImages(context: CallerContext) {
+    const caller=this.cells.caller(context.sessionToken);
+    invariant(caller.status==="active", "CALLER_NOT_ACTIVE", "Caller must be active");
+    return listReferenceImages(this.root);
+  }
+
+  registerReferenceImage(context: CallerContext, input: {sourcePath?:string;imageBase64?:string;filename?:string;part?:string;view?:string;description?:string}) {
+    const caller=this.cells.caller(context.sessionToken);
+    invariant(caller.kind==="director" && caller.status==="active", "DIRECTOR_NOT_ACTIVE", "Only active Director may register reference images");
+    const entry=registerReferenceImage(this.root,input);
+    return {...entry,count:listReferenceImages(this.root).count};
+  }
+
   async createStart(context: CallerContext, cellNo: number, meaning: unknown) {
     const query = this.runtimes.currentQuery();
     invariant(query, "QUERY_NOT_REGISTERED", "Register the agreed Query before creating Start");

@@ -16,6 +16,9 @@ parser.add_argument("--output", type=Path, required=True)
 parser.add_argument("--side", choices=("left", "right"), default=None)
 parser.add_argument("--manifest", type=Path, default=Path("modeling/reference_images/manifest.json"))
 parser.add_argument("--resolution", type=int, default=1024)
+parser.add_argument("--engine", choices=("CYCLES","EEVEE"), default="CYCLES",
+                    help="CPU Cycles works without a display server; EEVEE requires GPU/EGL")
+parser.add_argument("--samples", type=int, default=16)
 parser.add_argument("--ortho-scale", type=float, default=None, help="Fixed shared orthographic scale for comparisons")
 parser.add_argument("--camera-center", type=float, nargs=3, default=None, metavar=("X","Y","Z"),
                     help="Fixed shared camera center for comparisons")
@@ -25,9 +28,7 @@ from mathutils import Vector
 import bpy
 
 side = args.side
-if side is None:
-    if not args.manifest.is_file():
-        raise SystemExit("Reference manifest not found; specify --side left|right explicitly")
+if side is None and args.manifest.is_file():
     side = json.loads(args.manifest.read_text(encoding="utf-8")).get("side")
 if side not in (None, "left", "right"):
     raise SystemExit("Invalid side direction")
@@ -70,7 +71,18 @@ else:
     print("WARNING: model-dependent framing; do not compare sizes unless --ortho-scale and --camera-center are shared")
 
 scene = bpy.context.scene
-scene.render.engine = "BLENDER_EEVEE_NEXT"
+if args.engine == "CYCLES":
+    scene.render.engine = "CYCLES"
+    scene.cycles.device = "CPU"
+    scene.cycles.samples = args.samples
+    # Some distribution builds do not include OpenImageDenoiser.
+    for view_layer in scene.view_layers:
+        view_layer.cycles.use_denoising = False
+else:
+    try:
+        scene.render.engine = "BLENDER_EEVEE_NEXT"
+    except TypeError:
+        scene.render.engine = "BLENDER_EEVEE"
 scene.render.resolution_x = args.resolution
 scene.render.resolution_y = args.resolution
 scene.render.resolution_percentage = 100
@@ -101,8 +113,11 @@ scene.camera = camera
 camera_data.type = "ORTHO"
 camera_data.ortho_scale = camera_scale
 views = [("front", (0, -1, 0)), ("back", (0, 1, 0))]
-if side is not None:
-    views.insert(1, ("side", (1 if side == "right" else -1, 0, 0)))
+if side is None:
+    # Unknown reference side: render BOTH, then Director decides which matches.
+    views.extend([("side_left", (-1, 0, 0)), ("side_right", (1, 0, 0))])
+else:
+    views.append(("side", (1 if side == "right" else -1, 0, 0)))
 for name, axis in views:
     camera.location = center + Vector(axis) * max(4.0, camera_scale * 3)
     camera.rotation_euler = (center - camera.location).to_track_quat("-Z", "Y").to_euler()

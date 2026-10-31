@@ -1,56 +1,57 @@
 #!/usr/bin/env python3
-"""Validate one or more images in the 5-by-3 reference slots."""
+"""Validate any one or more image references, including a single multi-view montage."""
 from __future__ import annotations
 import json
 import sys
 from pathlib import Path
 
-PARTS = ("head", "upper_body", "lower_body", "accessories", "whole")
-VIEWS = ("front", "side", "back")
-EXTS = {".png", ".jpg", ".jpeg", ".webp"}
-MAGIC = {".png": b"\x89PNG\r\n\x1a\n", ".jpg": b"\xff\xd8\xff", ".jpeg": b"\xff\xd8\xff", ".webp": b"RIFF"}
+PARTS=("head","upper_body","lower_body","accessories","whole")
+VIEWS=("front","side","back")
+EXTS={".png",".jpg",".jpeg",".webp"}
+MAGIC={".png":b"\x89PNG\r\n\x1a\n",".jpg":b"\xff\xd8\xff",".jpeg":b"\xff\xd8\xff",".webp":b"RIFF"}
 
 def validate(root: Path):
-    problems, files = [], []
-    manifest_file = root / "manifest.json"
-    try:
-        manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as error:
-        return files, ["invalid/missing manifest.json: " + str(error)]
-    if manifest.get("schemaVersion") != 1: problems.append("schemaVersion must be 1")
-    if manifest.get("side") not in (None, "left", "right"): problems.append("side must be omitted, null, left or right")
-    if manifest.get("parts") != list(PARTS): problems.append("parts must list the five supported slots in order")
-    if manifest.get("views") != list(VIEWS): problems.append("views must list the supported view slots in order")
-    for part in PARTS:
-        directory = root / part
-        if directory.is_symlink():
-            problems.append(f"{part}: directory symlink is not allowed")
-            continue
-        for view in VIEWS:
-            candidates = [p for p in directory.glob(view + ".*") if p.suffix.lower() in EXTS and p.is_file()]
-            if not candidates:
-                continue  # Unfilled reference slots are valid.
-            if len(candidates) > 1:
-                problems.append(f"{part}/{view}: multiple images for the same slot")
+    files,errors=[],[]
+    manifest=root/"manifest.json"
+    if manifest.is_file():
+        try:
+            obj=json.loads(manifest.read_text(encoding="utf8"))
+            if not isinstance(obj,dict):
+                raise ValueError("manifest must be an object")
+            if obj.get("schemaVersion")!=1: errors.append("manifest schemaVersion must be 1")
+            if obj.get("side") not in (None,"left","right"): errors.append("side must be null, left or right")
+            if obj.get("parts",list(PARTS))!=list(PARTS):errors.append("invalid part slots")
+            if obj.get("views",list(VIEWS))!=list(VIEWS):errors.append("invalid view slots")
+        except (OSError,ValueError,TypeError) as err:
+            errors.append(f"invalid manifest: {err}")
+    candidates=[]
+    if root.exists():
+        candidates.extend(p for p in root.iterdir() if p.is_file() and p.suffix.lower() in EXTS)
+        for name in (*PARTS,"inbox"):
+            directory=root/name
+            if directory.is_symlink():
+                errors.append(f"symlink directory: {directory}")
                 continue
-            image = candidates[0]
-            if image.is_symlink() or image.stat().st_size < 32:
-                problems.append(f"{part}/{image.name}: symlink or unexpectedly small file")
-                continue
-            with image.open("rb") as fp:
-                signature = fp.read(16)
-            if not signature.startswith(MAGIC[image.suffix.lower()]):
-                problems.append(f"{part}/{image.name}: invalid file signature")
-                continue
-            if image.suffix.lower() == ".webp" and signature[8:12] != b"WEBP":
-                problems.append(f"{part}/{image.name}: invalid WebP signature")
-                continue
+            if directory.is_dir():
+                candidates.extend(p for p in directory.iterdir() if p.suffix.lower() in EXTS)
+    for image in sorted(candidates):
+        try:
+            if image.is_symlink() or not image.is_file():
+                raise ValueError("symlink or non-file")
+            if image.stat().st_size<16:
+                raise ValueError("image too small")
+            with image.open("rb") as fh: sig=fh.read(16)
+            ext=image.suffix.lower()
+            if not sig.startswith(MAGIC[ext]) or (ext==".webp" and sig[8:12]!=b"WEBP"):
+                raise ValueError("image signature invalid")
             files.append(str(image))
-    if not files: problems.append("at least one reference image is required")
-    return files, problems
+        except (OSError,ValueError) as err:
+            errors.append(f"{image}: {err}")
+    if not files:errors.append("at least one reference image is required")
+    return files,errors
 
-if __name__ == "__main__":
-    folder = Path(sys.argv[1] if len(sys.argv) > 1 else "modeling/reference_images")
-    found, errors = validate(folder)
-    print(json.dumps({"ok": not errors, "found": len(found), "minimum": 1, "maximum": 15, "files": found, "issues": errors}, ensure_ascii=False, indent=2))
-    sys.exit(1 if errors else 0)
+if __name__=="__main__":
+    root=Path(sys.argv[1] if len(sys.argv)>1 else "modeling/reference_images")
+    found,issues=validate(root)
+    print(json.dumps({"ok":not issues,"found":len(found),"minimum":1,"files":found,"issues":issues},ensure_ascii=False,indent=2))
+    raise SystemExit(1 if issues else 0)
