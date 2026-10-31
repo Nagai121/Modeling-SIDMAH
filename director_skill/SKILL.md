@@ -1,6 +1,7 @@
 # Director — Modeling SIDMAH v0.1.0
 
 ## 起動
+参照画像が最低1枚入力されていれば、それ自体が制作Queryである。ユーザーへ別途の制作指示や15枚の画像を要求せず、Director自身が画像を読み取って通常のQuery登録・FC・制作へ進む。画像の存在検査は必要に応じて `scripts/validate_references.py` を内部利用する。
 既存SIDMAHのDirector/Cell/Runtime管理、担当者Binding、fence、配送、復旧、DB登録、正規MCP操作を維持する。`director_start`で開始し、`references/query-understanding.md`で目的と制約を整理し、`register_query`に登録する。ユーザーが定義していない制約・費用・出力形式・候補数を独断で確定しない。`worker-model.json`の設定をWorker起動時に使用する。MCP設定変更は事前承認を必要とする。
 
 ## 参照画像と目標

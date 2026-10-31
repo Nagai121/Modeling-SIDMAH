@@ -14,11 +14,12 @@ SIDMAH v2.0.2（親コミット `a85f66f626a4c2a00ef16909e59fc5a137fcad79`）の
 
 1. このリポジトリをそのままcloneし、プロジェクトルートでCodexまたはOpenCodeを開きます。
 2. `modeling/reference_images/` の15枠のいずれかに**最低1枚**の画像を配置します。側面方向は必要な場合のみ指定します。
-3. `python scripts/validate_references.py modeling/reference_images` で実際に配置した画像を検査します。
-4. `AGENTS.md` を読み、Directorとして入力画像を理解してからFCを実施します。FC Gate 2では検査用モデルを作りません。MCP設定は `.codex/config.toml` と `opencode.json` に収録されています。設定はプロジェクトルートからの相対パスです。
-5. Directorは`director_start`、`register_query`で作業を確定し、Cell・Workerへ`create_cell_assignment`と`create_start_assignment`で作業を割り当てます。
-6. Workerは対象の`works/cell_<n>/work_place/`へ完成モデルと画像を置き、`modeling-result.json`を書いて`submit_modeling_work`を呼びます。
-7. Resultを受け取ったWorkerが`create_end_assignment`、Directorが`complete_end_review`で成果物と参照画像を比較します。必要な修正は新しいAssignmentとして渡します。
+3. `AGENTS.md` を読み、Directorは画像1枚以上の存在を自動確認し、入力画像そのものを制作Queryとして整理・登録してFCへ進みます。別途のQuery文や検査用の仮モデルは要求しません。FC Gate 2では検査用モデルを作りません。MCP設定は `.codex/config.toml` と `opencode.json` に収録されています。設定はプロジェクトルートからの相対パスです。
+4. Directorは`director_start`、`register_query`で作業を確定し、Cell・Workerへ`create_cell_assignment`と`create_start_assignment`で作業を割り当てます。
+5. Workerは対象の`works/cell_<n>/work_place/`へ完成モデルと画像を置き、`modeling-result.json`を書いて`submit_modeling_work`を呼びます。
+6. Resultを受け取ったWorkerが`create_end_assignment`、Directorが`complete_end_review`で成果物と参照画像を比較します。必要な修正は新しいAssignmentとして渡します。
+
+画像の配置を手動で検査する場合に限り `python scripts/validate_references.py modeling/reference_images` を使用できます。通常はDirectorがFCで検査します。
 
 ## 3D制作の専門機能
 
