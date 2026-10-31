@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { basename, extname, resolve } from "node:path";
+import { basename, extname, relative, resolve, sep } from "node:path";
 import { invariant } from "../core/errors.ts";
 
 const PARTS = ["head","upper_body","lower_body","accessories","whole"];
@@ -51,7 +51,12 @@ export function listReferenceImages(projectRoot:string) {
   const images=sourceFiles(folder).sort().map(fullPath=>{
     assertImage(fullPath);
     const e=indexed.get(fullPath);
-    return {path:fullPath, name:basename(fullPath), part:e?.part??null,view:e?.view??null,
+    const rel=relative(folder,fullPath).split(sep);
+    const slotPart=rel.length===2 && PARTS.includes(rel[0]) ? rel[0] : null;
+    const stem=basename(fullPath,extname(fullPath));
+    const slotView=slotPart && VIEWS.includes(stem) ? stem : null;
+    return {path:fullPath, name:basename(fullPath),
+      part:e?.part??slotPart,view:e?.view??slotView,
       description:e?.description??null, sha256:e?.sha256??createHash("sha256").update(readFileSync(fullPath)).digest("hex"),
       sourceName:e?.sourceName??null, composite: e?.view === "composite" };
   });

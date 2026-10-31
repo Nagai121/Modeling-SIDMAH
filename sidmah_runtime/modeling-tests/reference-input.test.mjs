@@ -40,6 +40,10 @@ test("manual reference slot and inbox are listed together",()=>{
    mkdirSync(folder,{recursive:true});
    writeFileSync(join(folder,"front.png"),PNG);
    registerReferenceImage(root,{imageBase64:PNG.toString("base64"),filename:"whole-image.png",part:"whole",view:"composite"});
-   assert.equal(listReferenceImages(root).count,2);
+   const entries=listReferenceImages(root);
+   assert.equal(entries.count,2);
+   const slotted=entries.images.find(x=>x.name==="front.png");
+   assert.equal(slotted.part,"head");
+   assert.equal(slotted.view,"front");
  }finally{rmSync(root,{recursive:true,force:true})}
 });
