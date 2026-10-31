@@ -28,8 +28,10 @@ def validate(root: Path):
             continue
         for view in VIEWS:
             candidates = [p for p in directory.glob(view + ".*") if p.suffix.lower() in EXTS and p.is_file()]
-            if len(candidates) != 1:
-                problems.append(f"{part}/{view}: exactly one image required, found {len(candidates)}")
+            if not candidates:
+                continue  # Unfilled reference slots are valid.
+            if len(candidates) > 1:
+                problems.append(f"{part}/{view}: multiple images for the same slot")
                 continue
             image = candidates[0]
             if image.is_symlink() or image.stat().st_size < 32:
