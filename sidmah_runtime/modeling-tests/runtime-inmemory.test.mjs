@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync } from "node:fs";
+import { mkdtempSync, mkdirSync, cpSync, writeFileSync, readFileSync, rmSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { SidmahSystem } from "../src/system.ts";
@@ -83,6 +83,15 @@ test("Start, frozen artifact, Result, End and review work offline",async()=>{
     const state=e.system.runtimes.db.prepare("SELECT * FROM runtimes WHERE runtime_id=?").get(runtime.runtimeId);
     assert.equal(state.state,"finished");assert.equal(state.execution_status,"success");
     const dir=join(e.root,"works","cell_"+cell.cellNo,"runtime_"+runtime.runtimeNo);
+    const archive=join(dir,"snapshot-"+runtime.runtimeNo+".tar.zst");
+    const archiveState=e.system.runtimes.db.prepare("SELECT archive_state FROM runtimes WHERE runtime_id=?").get(runtime.runtimeId).archive_state;
+    if(archiveState==="fixed"){
+      assert.equal(existsSync(archive),true);
+      assert.equal(readFileSync(archive).subarray(0,4).equals(Buffer.from([0x28,0xb5,0x2f,0xfd])),true);
+    } else {
+      // A missing Zstd compressor must preserve the Snapshot for later recovery.
+      assert.equal(existsSync(join(dir,"snapshot-"+runtime.runtimeNo)),true);
+    }
     const artifact=join(dir,"artifacts","out","model.glb");
     assert.equal(existsSync(artifact),true);
     const result=JSON.parse(readFileSync(state.result_ref,"utf8"));
@@ -109,6 +118,29 @@ test("a permanent error after Start commitment becomes an auditable failure Resu
     assert.equal(state.state,"finished");
     assert.equal(state.execution_status,"failure");
     assert.match(readFileSync(state.result_ref,"utf8"),/deliberate processing failure/);
+  } finally {e.close()}
+});
+
+
+test("committed Snapshot is adopted and completed after restarting the runtime manager",async()=>{
+  const e=setup();
+  try{
+    const {worker,cell,runtime,work}=await start(e);
+    const runtimeDir=join(e.root,"works","cell_"+cell.cellNo,"runtime_"+runtime.runtimeNo);
+    const snapshot=join(runtimeDir,"snapshot-"+runtime.runtimeNo);
+    mkdirSync(runtimeDir,{recursive:true});
+    cpSync(work,snapshot,{recursive:true});
+    const recorded=e.system.runtimes.treeManifest(snapshot);
+    const source=e.system.runtimes.treeManifest(work);
+    e.system.runtimes.db.prepare(
+      "UPDATE runtimes SET snapshot_state='commit_pending',snapshot_diagnostics_json=?,snapshot_source_hash=?,snapshot_source_path=?,snapshot_destination_path=? WHERE runtime_id=?"
+    ).run(JSON.stringify({manifest:recorded}),source.hash,work,snapshot,runtime.runtimeId);
+    await e.system.runtimes.recover();
+    const state=e.system.runtimes.db.prepare("SELECT * FROM runtimes WHERE runtime_id=?").get(runtime.runtimeId);
+    assert.equal(state.state,"finished");
+    assert.equal(state.execution_status,"success");
+    const result=JSON.parse(readFileSync(state.result_ref,"utf8"));
+    assert.equal(verifyFixedArtifacts(runtimeDir,result),true);
   } finally {e.close()}
 });
 
