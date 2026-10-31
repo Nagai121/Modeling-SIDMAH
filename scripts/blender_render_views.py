@@ -16,6 +16,9 @@ parser.add_argument("--output", type=Path, required=True)
 parser.add_argument("--side", choices=("left", "right"), default=None)
 parser.add_argument("--manifest", type=Path, default=Path("modeling/reference_images/manifest.json"))
 parser.add_argument("--resolution", type=int, default=1024)
+parser.add_argument("--engine", choices=("CYCLES","EEVEE"), default="CYCLES",
+                    help="CPU Cycles works without a display server; EEVEE requires GPU/EGL")
+parser.add_argument("--samples", type=int, default=16)
 parser.add_argument("--ortho-scale", type=float, default=None, help="Fixed shared orthographic scale for comparisons")
 parser.add_argument("--camera-center", type=float, nargs=3, default=None, metavar=("X","Y","Z"),
                     help="Fixed shared camera center for comparisons")
@@ -68,11 +71,15 @@ else:
     print("WARNING: model-dependent framing; do not compare sizes unless --ortho-scale and --camera-center are shared")
 
 scene = bpy.context.scene
-try:
-    scene.render.engine = "BLENDER_EEVEE_NEXT"
-except TypeError:
-    # Blender <= 4.1 uses the previous Eevee engine name.
-    scene.render.engine = "BLENDER_EEVEE"
+if args.engine == "CYCLES":
+    scene.render.engine = "CYCLES"
+    scene.cycles.device = "CPU"
+    scene.cycles.samples = args.samples
+else:
+    try:
+        scene.render.engine = "BLENDER_EEVEE_NEXT"
+    except TypeError:
+        scene.render.engine = "BLENDER_EEVEE"
 scene.render.resolution_x = args.resolution
 scene.render.resolution_y = args.resolution
 scene.render.resolution_percentage = 100
