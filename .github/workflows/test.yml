@@ -1,0 +1,28 @@
+name: Modeling SIDMAH tests
+on:
+  push:
+    branches: [main, v0.1.1-validation]
+  pull_request:
+  workflow_dispatch:
+jobs:
+  offline-tests:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Run offline runtime and MCP tests (no paid API)
+        working-directory: sidmah_runtime
+        run: npm test
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Reference input tests
+        run: python -m unittest discover -s tests -p 'test_*.py' -v

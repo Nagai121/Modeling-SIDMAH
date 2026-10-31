@@ -11,10 +11,10 @@ from validate_references import validate, PARTS, VIEWS
 PNG = bytes.fromhex("89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000b49444154789c636000020000050001a5f645400000000049454e44ae426082")
 
 class ReferenceSchemaTest(unittest.TestCase):
-    def test_15_images_required(self):
+    def test_one_image_sufficient_and_empty_rejected(self):
         with tempfile.TemporaryDirectory() as folder:
             root=Path(folder)
-            (root/"manifest.json").write_text(json.dumps({"schemaVersion":1,"side":"right","parts":list(PARTS),"views":list(VIEWS)}),encoding="utf-8")
+            (root/"manifest.json").write_text(json.dumps({"schemaVersion":1,"side":None,"parts":list(PARTS),"views":list(VIEWS)}),encoding="utf-8")
             for part in PARTS:
                 (root/part).mkdir()
                 for view in VIEWS:
@@ -22,8 +22,15 @@ class ReferenceSchemaTest(unittest.TestCase):
             present,issues=validate(root)
             self.assertEqual(len(present),15)
             self.assertFalse(issues)
-            (root/"head"/"back.png").unlink()
+            for part in PARTS:
+                for view in VIEWS:
+                    if (part, view) != ("head","front"):
+                        (root/part/(view+".png")).unlink()
+            present,issues=validate(root)
+            self.assertEqual(len(present),1)
+            self.assertFalse(issues)
+            (root/"head"/"front.png").unlink()
             _,issues=validate(root)
-            self.assertTrue(issues)
+            self.assertIn("at least one reference image is required",issues)
 
 if __name__=="__main__": unittest.main()

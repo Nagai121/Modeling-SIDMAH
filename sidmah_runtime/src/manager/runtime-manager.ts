@@ -12,6 +12,7 @@ import { endMeaning, startMeaning } from "../core/validation.ts";
 import type { CellManager } from "./cell-manager.ts";
 import { writeFixedResult } from "../runtime/fixed-result.ts";
 import { ensureModelingDatabase } from "../core/harness-identity.ts";
+import { validateModelingOutput, verifyFixedArtifacts, hashFile } from "../runtime/artifact-validation.ts";
 
 type FixedResult = { resultRef: string; resultHash: string; manifestRef?: string; executionStatus: string };
 export type QueryContext = { queryNo: number; revisionNo: number };
@@ -92,11 +93,10 @@ export class RuntimeManager {
     return row && { queryNo: row.query_no, revisionNo: row.revision_no };
   }
 
-  createStartAssignment(sessionToken: string, cellNo: number, rawMeaning: unknown, timeoutMs?: number, query?: QueryContext): { startId: string; runtimeId: string; runtimeNo: number } {
+  createStartAssignment(sessionToken: string, cellNo: number, rawMeaning: unknown, query?: QueryContext): { startId: string; runtimeId: string; runtimeNo: number } {
     const meaning = startMeaning(rawMeaning);
     const caller = this.cells.caller(sessionToken);
     invariant(caller.kind === "director" && caller.status === "active", "DIRECTOR_NOT_ACTIVE", "Only the active Director may create Start");
-    invariant(timeoutMs === undefined || (Number.isSafeInteger(timeoutMs) && timeoutMs > 0), "TIMEOUT_INVALID", "Runtime timeout must be a positive integer when specified");
     invariant(this.cells.currentBinding(cellNo), "CELL_HAS_NO_WORKER", "Cell has no active Worker");
     const output = transaction(this.db, () => {
       this.db.prepare("INSERT OR IGNORE INTO runtime_counters VALUES(?,0)").run(cellNo);
@@ -104,7 +104,7 @@ export class RuntimeManager {
       const runtimeNo = Number((this.db.prepare("SELECT value FROM runtime_counters WHERE cell_no=?").get(cellNo) as any).value);
       const startId = randomUUID(), runtimeId = randomUUID();
       this.db.prepare("INSERT INTO starts VALUES(?,?,?,?,?,'dispatch_pending',?)").run(startId, runtimeId, cellNo, runtimeNo, json(meaning), Date.now());
-      this.db.prepare("INSERT INTO runtimes(runtime_id,cell_no,runtime_no,state,timeout_ms,snapshot_state,archive_state,cleanup_state) VALUES(?,?,?,'created',?,'none','pending','pending')").run(runtimeId, cellNo, runtimeNo, timeoutMs ?? 0);
+      this.db.prepare("INSERT INTO runtimes(runtime_id,cell_no,runtime_no,state,timeout_ms,snapshot_state,archive_state,cleanup_state) VALUES(?,?,?,'created',?,'none','pending','pending')").run(runtimeId, cellNo, runtimeNo, 0);
       this.db.prepare("INSERT INTO worker_dispatch VALUES(?,'start',?,?,30,'pending',?)").run(startId, cellNo, json({ startId, runtimeId, runtimeNo, cellNo, meaning }), Date.now());
       if (query) this.db.prepare("INSERT INTO runtime_queries VALUES(?,?,?,?)").run(runtimeId, query.queryNo, query.revisionNo, Date.now());
       return { startId, runtimeId, runtimeNo };
@@ -132,34 +132,6 @@ export class RuntimeManager {
     return count;
   }
 
-  private validateModelingOutput(folder: string): { primaryModel: string; previewImages: string[]; otherFiles: string[]; notes?: string } {
-    const path = resolve(folder, "modeling-result.json");
-    invariant(existsSync(path), "MODEL_RESULT_MISSING", "Work Place must contain modeling-result.json");
-    const result = JSON.parse(readFileSync(path, "utf8"));
-    invariant(result && result.schemaVersion === 1 && typeof result.primaryModel === "string"
-      && Array.isArray(result.previewImages) && Array.isArray(result.otherFiles),
-      "MODEL_RESULT_INVALID", "modeling-result.json is invalid");
-    const all = [result.primaryModel, ...result.previewImages, ...result.otherFiles];
-    invariant(all.every((p: unknown) => typeof p === "string" && p.length > 0),
-      "MODEL_PATH_INVALID", "Artifact paths must be non-empty strings");
-    invariant(new Set(all).size === all.length, "MODEL_PATH_DUPLICATE", "Duplicate artifact paths");
-    for (const p of all) {
-      invariant(!isAbsolute(p) && !p.split(/[\\/]/).includes(".."), "MODEL_PATH_ESCAPE", "Artifact path escapes Work Place");
-      const abs = resolve(folder, p), rel = relative(folder, abs);
-      invariant(rel !== ".." && !rel.startsWith(".." + sep) && !isAbsolute(rel), "MODEL_PATH_ESCAPE", "Artifact path escapes Work Place");
-      let cursor = folder;
-      for (const component of rel.split(sep)) {
-        cursor = resolve(cursor, component);
-        invariant(existsSync(cursor) && !lstatSync(cursor).isSymbolicLink(), "MODEL_PATH_SYMLINK", "Symlink or missing artifact");
-      }
-      invariant(lstatSync(abs).isFile() && lstatSync(abs).size > 0, "MODEL_ARTIFACT_INVALID", "Artifact is missing or empty");
-    }
-    invariant(/\.(blend|glb|gltf|fbx|obj)$/i.test(result.primaryModel), "MODEL_FORMAT_INVALID", "Unsupported primary model type");
-    invariant(result.previewImages.every((p: string) => /\.(png|jpg|jpeg|webp)$/i.test(p)),
-      "MODEL_PREVIEW_INVALID", "Preview images must be images");
-    return result;
-  }
-
   private freezeSnapshot(path: string): void {
     const stat = lstatSync(path);
     if (stat.isDirectory()) {
@@ -184,19 +156,6 @@ export class RuntimeManager {
     return resolve(this.root, "works", `cell_${runtime.cell_no}`, `runtime_${runtime.runtime_no}`);
   }
 
-  private fileHash(file: string): string {
-    const hash = createHash("sha256"), fd = openSync(file, "r");
-    const buffer = Buffer.allocUnsafe(1024 * 1024);
-    try {
-      for (;;) {
-        const n = readSync(fd, buffer, 0, buffer.length, null);
-        if (n === 0) break;
-        hash.update(buffer.subarray(0, n));
-      }
-    } finally { closeSync(fd); }
-    return hash.digest("hex");
-  }
-
   private treeManifest(root: string): { hash: string; entries: Array<Record<string, unknown>> } {
     const entries: Array<Record<string, unknown>> = [];
     const visit = (path: string, relative: string): void => {
@@ -206,11 +165,19 @@ export class RuntimeManager {
         entries.push({ path: relative || ".", type: "directory", mode: stat.mode, size: stat.size });
         for (const name of readdirSync(path).sort()) visit(resolve(path, name), relative ? `${relative}/${name}` : name);
       } else {
-        entries.push({ path: relative, type: "file", mode: stat.mode, size: stat.size, sha256: this.fileHash(path) });
+        entries.push({ path: relative, type: "file", mode: stat.mode, size: stat.size, sha256: hashFile(path) });
       }
     };
     visit(root, "");
     return { hash: createHash("sha256").update(json(entries)).digest("hex"), entries };
+  }
+
+  private manifestContentHash(manifest: { entries: Array<Record<string, unknown>> }): string {
+    // File names, file sizes and hashes are invariant across copy/chmod.
+    const normalized = manifest.entries.map(x => ({
+      path: x.path, type: x.type, bytes: x.type === "file" ? x.size : undefined, sha256: x.sha256,
+    }));
+    return createHash("sha256").update(json(normalized)).digest("hex");
   }
 
   private aclSummary(path: string): Record<string, unknown> {
@@ -254,7 +221,7 @@ export class RuntimeManager {
     }
   }
 
-  async submitModelingWork(sessionToken: string): Promise<{ runtimeId: string; snapshotDirectory: string }> {
+  async submitModelingWork(sessionToken: string): Promise<{ runtimeId: string; snapshotDirectory: string; executionStatus: string }> {
     const item = this.cells.claimWorkerItemForMcpCall(sessionToken, "start");
     const startId = item.source_id;
     const start = this.db.prepare("SELECT * FROM starts WHERE start_id=?").get(startId) as any;
@@ -267,10 +234,12 @@ export class RuntimeManager {
     const runtimeDir = this.runtimeDirectory(start);
     const snapshot = resolve(runtimeDir, `snapshot-${start.runtime_no}`);
     mkdirSync(runtimeDir, { recursive: true });
-    this.validateModelingOutput(workPlace);
+    validateModelingOutput(workPlace);
     let current = this.db.prepare("SELECT * FROM runtimes WHERE runtime_id=?").get(runtime.runtime_id) as any;
     let temporary = ["commit_failed", "commit_pending"].includes(current.snapshot_state) ? current.snapshot_temporary_path : undefined;
-    const sourceHash = this.treeManifest(workPlace).hash;
+    const sourceManifest = this.treeManifest(workPlace);
+    const sourceHash = sourceManifest.hash;
+    const sourceContentHash = this.manifestContentHash(sourceManifest);
     if (!temporary || !existsSync(temporary) || current.snapshot_source_hash !== sourceHash) {
       temporary = `${snapshot}.${randomUUID()}.tmp`;
       transaction(this.db, () => this.db.prepare("UPDATE runtimes SET snapshot_state='copying',snapshot_temporary_path=?,snapshot_source_path=?,snapshot_destination_path=?,snapshot_source_hash=? WHERE runtime_id=?").run(temporary, workPlace, snapshot, sourceHash, runtime.runtime_id));
@@ -282,7 +251,11 @@ export class RuntimeManager {
         throw error;
       }
     }
-    this.validateModelingOutput(temporary);
+    validateModelingOutput(temporary);
+    const destinationContentHash = this.manifestContentHash(this.treeManifest(temporary));
+    const currentContentHash = this.manifestContentHash(this.treeManifest(workPlace));
+    invariant(sourceContentHash === destinationContentHash && sourceContentHash === currentContentHash,
+      "SNAPSHOT_COPY_MISMATCH", "Work Place changed during copy or copied Snapshot differs");
     await this.commitSnapshot(runtime.runtime_id, temporary, snapshot, workPlace, sourceHash);
     this.freezeSnapshot(snapshot);
     const executorToken = randomUUID();
@@ -303,9 +276,14 @@ export class RuntimeManager {
       throw error;
     }
     this.cells.completeItemBySource("start", startId);
-    await this.completeModelingRuntime(runtime.runtime_id);
+    try { await this.completeModelingRuntime(runtime.runtime_id); }
+    catch (error) {
+      this.log.write("modeling_work_failed", { runtimeId: runtime.runtime_id, error: String(error) });
+      await this.publishModelingFailure(runtime.runtime_id, error);
+    }
     this.log.write("modeling_work_submitted", { runtimeId: runtime.runtime_id, snapshot });
-    return { runtimeId: runtime.runtime_id, snapshotDirectory: snapshot };
+    const finished = this.db.prepare("SELECT execution_status FROM runtimes WHERE runtime_id=?").get(runtime.runtime_id) as any;
+    return { runtimeId: runtime.runtime_id, snapshotDirectory: snapshot, executionStatus: finished?.execution_status };
   }
 
   private async completeModelingRuntime(runtimeId: string): Promise<void> {
@@ -313,20 +291,20 @@ export class RuntimeManager {
     if (!runtime || runtime.state === "finished") return;
     invariant(runtime.state === "launching", "MODELING_STATE_INVALID", "Runtime must be launching");
     const dir = this.runtimeDirectory(runtime), snapshot = resolve(dir, `snapshot-${runtime.runtime_no}`);
-    const declared = this.validateModelingOutput(snapshot);
+    const declared = validateModelingOutput(snapshot);
     const artifacts = [declared.primaryModel, ...declared.previewImages, ...declared.otherFiles];
     const copied: Array<{ path: string; sha256: string; bytes: number }> = [];
     for (const rel of artifacts) {
       const src = resolve(snapshot, rel), dest = resolve(dir, "artifacts", rel);
       mkdirSync(dirname(dest), { recursive: true });
-      const sha256 = this.fileHash(src);
-      if (existsSync(dest)) invariant(this.fileHash(dest) === sha256,
+      const sha256 = hashFile(src);
+      if (existsSync(dest)) invariant(hashFile(dest) === sha256,
         "MODEL_ARTIFACT_COLLISION", "Existing fixed artifact differs from Snapshot");
       else {
         const temporary = `${dest}.${randomUUID()}.tmp`;
         copyFileSync(src, temporary);
         renameSync(temporary, dest);
-        invariant(this.fileHash(dest) === sha256, "MODEL_ARTIFACT_HASH", "Copied model differs from frozen source");
+        invariant(hashFile(dest) === sha256, "MODEL_ARTIFACT_HASH", "Copied model differs from frozen source");
       }
       copied.push({ path: rel, sha256, bytes: lstatSync(src).size });
     }
@@ -336,10 +314,38 @@ export class RuntimeManager {
     this.finishResult(runtimeId, () => ({
       ...writeFixedResult(dir, runtimeId, result), executionStatus: "success",
     }));
-    this.drainWorkerDispatch();
-    try { await this.cells.dispatchNextForCell(runtime.cell_no); }
-    catch (error) { this.log.write("result_delivery_failed", { runtimeId, cellNo: runtime.cell_no, error: String(error) }); }
-    await this.archive(runtimeId);
+    await this.deliverFixedResult(runtime);
+  }
+
+  private async deliverFixedResult(runtime: any): Promise<void> {
+    try {
+      this.drainWorkerDispatch();
+      await this.cells.dispatchNextForCell(runtime.cell_no);
+    } catch (error) {
+      // The committed Result remains available for restart-based delivery.
+      this.log.write("result_delivery_failed", { runtimeId: runtime.runtime_id, cellNo: runtime.cell_no, error: String(error) });
+    }
+    try { await this.archive(runtime.runtime_id); }
+    catch (error) { this.log.write("snapshot_archive_failed", { runtimeId: runtime.runtime_id, error: String(error) }); }
+  }
+
+  private async publishModelingFailure(runtimeId: string, error: unknown): Promise<void> {
+    const runtime = this.db.prepare("SELECT * FROM runtimes WHERE runtime_id=?").get(runtimeId) as any;
+    if (!runtime || runtime.state === "finished") return;
+    invariant(runtime.state === "launching", "MODELING_STATE_INVALID", "Failure is not eligible for publication");
+    if (this.recoverOneFilesystemResult(runtime)) {
+      await this.deliverFixedResult(runtime);
+      return;
+    }
+    const dir = this.runtimeDirectory(runtime);
+    const failure = {
+      schemaVersion: 1, type: "modeling", executionStatus: "failure", artifacts: [],
+      error: error instanceof Error ? error.message : String(error),
+    };
+    this.finishResult(runtimeId, () => ({
+      ...writeFixedResult(dir, runtimeId, failure), executionStatus: "failure",
+    }));
+    await this.deliverFixedResult(runtime);
   }
 
   private readFilesystemResult(runtime: any): FixedResult | undefined {
@@ -350,7 +356,8 @@ export class RuntimeManager {
       const body = readFileSync(resultRef, "utf8");
       const hash = createHash("sha256").update(body).digest("hex");
       const result = JSON.parse(body);
-      if (manifest.complete === true && manifest.runtimeId === runtime.runtime_id && manifest.resultHash === hash) {
+      if (manifest.complete === true && manifest.runtimeId === runtime.runtime_id && manifest.resultHash === hash &&
+        verifyFixedArtifacts(dir, result)) {
         return { resultRef, resultHash: hash, manifestRef, executionStatus: String(result.executionStatus) };
       }
     } catch {}
@@ -391,6 +398,9 @@ export class RuntimeManager {
     const context = this.db.prepare("SELECT c.*,r.cell_no FROM result_contexts c JOIN runtimes r ON r.runtime_id=c.runtime_id WHERE c.context_id=?").get(contextId) as any;
     invariant(context && context.state === "inbox_registered", "RESULT_CONTEXT_INVALID", "Active Result context is not available");
     this.cells.validateWorker(context.cell_no, sessionToken);
+    const owningRuntime = this.db.prepare("SELECT * FROM runtimes WHERE runtime_id=?").get(context.runtime_id);
+    invariant(this.readFilesystemResult(owningRuntime), "RESULT_ARTIFACT_CORRUPT",
+      "Fixed Result files are missing or no longer match their hashes");
     const output = transaction(this.db, () => {
       const end = this.db.prepare("SELECT * FROM ends WHERE runtime_id=?").get(context.runtime_id) as any;
       invariant(end?.state === "meaning_pending" && end.end_assignment_id === null, "END_ALREADY_ASSIGNED", "End meaning is already assigned");
@@ -566,7 +576,10 @@ export class RuntimeManager {
     const dir = this.runtimeDirectory(runtime), snapshotName = `snapshot-${runtime.runtime_no}`;
     const snapshot = resolve(dir, snapshotName);
     const attempts: Array<Record<string, unknown>> = [];
-    const temporary = resolve(dir, `${snapshotName}.tar.zst.${randomUUID()}.tmp`), final = resolve(dir, `${snapshotName}.tar.zst`);
+    // Keep the extension .tar.zst on the actual tar output: tar -a detects
+    // compression from the final suffix, not from the renamed destination.
+    const archiveTempDir = resolve(dir, `.archive-${randomUUID()}`);
+    const temporary = resolve(archiveTempDir, `${snapshotName}.tar.zst`), final = resolve(dir, `${snapshotName}.tar.zst`);
     const cleanup = () => {
       try {
         invariant(existsSync(final), "ARCHIVE_MISSING", "Fixed archive is missing; preserve Snapshot");
@@ -585,16 +598,24 @@ export class RuntimeManager {
     catch (error) { this.log.write("snapshot_archive_state_failed", { runtimeId, error: String(error) }); return; }
     for (let attempt=1; attempt<=3; attempt++) {
       try {
-        if (existsSync(temporary)) rmSync(temporary, { force: true });
+        mkdirSync(archiveTempDir, { recursive: true });
         const result = spawnSync("tar", ["-caf", temporary, "-C", dir, snapshotName], { windowsHide: true });
-        if (result.status !== 0 || !existsSync(temporary)) throw new Error(`tar failed: status=${result.status}; ${result.stderr?.toString() ?? ""}`);
+        if (result.status !== 0 || !existsSync(temporary))
+          throw new Error(`tar failed: status=${result.status}; ${result.stderr?.toString() ?? ""}`);
+        const fd = openSync(temporary, "r"), header = Buffer.alloc(4);
+        try { invariant(readSync(fd, header, 0, 4, 0) === 4 && header.equals(Buffer.from([0x28,0xb5,0x2f,0xfd])),
+          "ARCHIVE_CODEC_MISMATCH", "tar output is not actually Zstandard-compressed"); }
+        finally { closeSync(fd); }
+        const checked = spawnSync("tar", ["-tf", temporary], { encoding: "utf8", windowsHide: true });
+        invariant(checked.status === 0, "ARCHIVE_INVALID", "Zstandard archive cannot be read");
         renameSync(temporary, final);
+        rmSync(archiveTempDir, { recursive: true, force: true });
         transaction(this.db, () => this.db.prepare("UPDATE runtimes SET archive_state='fixed' WHERE runtime_id=?").run(runtimeId));
         cleanup();
         this.log.write("snapshot_archived", { runtimeId, final }); return;
       } catch (error) {
         attempts.push({ attempt, at: Date.now(), error: String(error) });
-        rmSync(temporary, { force: true });
+        rmSync(archiveTempDir, { recursive: true, force: true });
         const latest = this.db.prepare("SELECT archive_state FROM runtimes WHERE runtime_id=?").get(runtimeId) as any;
         if (latest?.archive_state === "fixed") { cleanup(); return; }
       }
@@ -620,14 +641,24 @@ export class RuntimeManager {
 
   private recoverCreatedSnapshots(): number {
     const rows = this.db.prepare(`SELECT r.*,s.start_id FROM runtimes r JOIN starts s ON s.runtime_id=r.runtime_id
-      WHERE r.state='created' AND r.snapshot_state IN('none','commit_pending')`).all() as any[];
+      WHERE r.state='created' AND r.snapshot_state IN('none','commit_pending','copying','commit_failed')`).all() as any[];
     let recovered = 0;
     for (const runtime of rows) {
       const runtimeDir = this.runtimeDirectory(runtime);
       const snapshot = resolve(runtimeDir, `snapshot-${runtime.runtime_no}`);
+      if (runtime.snapshot_state === "copying" ||
+          (runtime.snapshot_state === "commit_failed" && !existsSync(snapshot))) {
+        // Interrupted copies are never published. Drop the temporary tree and
+        // allow the original Start to be submitted again by its active Worker.
+        if (runtime.snapshot_temporary_path && existsSync(runtime.snapshot_temporary_path))
+          this.removeSnapshot(runtime.snapshot_temporary_path);
+        if (existsSync(snapshot)) this.removeSnapshot(snapshot);
+        this.db.prepare("UPDATE runtimes SET snapshot_state='none',snapshot_temporary_path=NULL WHERE runtime_id=? AND state='created'").run(runtime.runtime_id);
+        continue;
+      }
       if (!existsSync(snapshot)) continue;
       try {
-        if (runtime.snapshot_state === "commit_pending") {
+        if (runtime.snapshot_state === "commit_pending" || runtime.snapshot_state === "commit_failed") {
           const actual = this.treeManifest(snapshot);
           const saved = runtime.snapshot_diagnostics_json ? parseJson<any>(runtime.snapshot_diagnostics_json).manifest : undefined;
           // Freezing removes write permissions; directory sizes can change during a copy.
@@ -640,16 +671,17 @@ export class RuntimeManager {
           }
           invariant(matches, "SNAPSHOT_RECOVERY_MISMATCH", "Committed Snapshot does not match its recorded source");
         }
-        this.validateModelingOutput(snapshot);
+        validateModelingOutput(snapshot);
         this.freezeSnapshot(snapshot);
       } catch (error) {
         this.removeSnapshot(snapshot);
-        this.db.prepare("UPDATE runtimes SET snapshot_state='none' WHERE runtime_id=? AND state='created'").run(runtime.runtime_id);
+        this.db.prepare("UPDATE runtimes SET snapshot_state='none',snapshot_temporary_path=NULL WHERE runtime_id=? AND state='created'").run(runtime.runtime_id);
         this.log.write("orphan_snapshot_rejected", { runtimeId: runtime.runtime_id, error: String(error) });
         continue;
       }
       if (this.cells.workerItemState("start", runtime.start_id) !== "active") {
         this.removeSnapshot(snapshot);
+        this.db.prepare("UPDATE runtimes SET snapshot_state='none',snapshot_temporary_path=NULL WHERE runtime_id=? AND state='created'").run(runtime.runtime_id);
         this.log.write("stale_snapshot_discarded", { runtimeId: runtime.runtime_id });
         continue;
       }
@@ -669,7 +701,7 @@ export class RuntimeManager {
         recovered++;
       } else {
         const current = this.db.prepare("SELECT state FROM runtimes WHERE runtime_id=?").get(runtime.runtime_id) as any;
-        if (current?.state === "created" && existsSync(snapshot)) { this.removeSnapshot(snapshot); }
+        if (current?.state === "created" && existsSync(snapshot)) { this.removeSnapshot(snapshot); this.db.prepare("UPDATE runtimes SET snapshot_state='none',snapshot_temporary_path=NULL WHERE runtime_id=?").run(runtime.runtime_id); }
       }
     }
     return recovered;
@@ -689,7 +721,11 @@ export class RuntimeManager {
     const launching = this.db.prepare("SELECT runtime_id,executor_token FROM runtimes WHERE state='launching'").all() as any[];
     for (const row of launching) {
       try { await this.completeModelingRuntime(row.runtime_id); }
-      catch (error) { this.log.write("modeling_recovery_failed", { runtimeId: row.runtime_id, error: String(error) }); }
+      catch (error) {
+        this.log.write("modeling_recovery_failed", { runtimeId: row.runtime_id, error: String(error) });
+        try { await this.publishModelingFailure(row.runtime_id, error); }
+        catch (failureError) { this.log.write("modeling_failure_publication_failed", { runtimeId: row.runtime_id, error: String(failureError) }); }
+      }
     }
     this.reconcileWorkerCompletions();
     this.drainWorkerDispatch();

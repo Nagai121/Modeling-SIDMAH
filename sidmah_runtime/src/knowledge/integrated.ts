@@ -5,6 +5,7 @@ import { basename, isAbsolute, relative, resolve, sep } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { openDb, transaction } from "../core/db.ts";
 import { invariant } from "../core/errors.ts";
+import { ensureModelingDatabase } from "../core/harness-identity.ts";
 
 type Row = Record<string, any>;
 type Source = { prefix: "cell" | "runtime"; db: DatabaseSync };
@@ -25,10 +26,8 @@ export class IntegratedStore {
     mkdirSync(resolve(root, "shared_databases"), { recursive: true });
     this.sources = [{ prefix: "cell", db: cells }, { prefix: "runtime", db: runtimes }];
     this.db = openDb(resolve(root, "state", "integrated.sqlite"));
-    const prior = this.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='query_revisions'").get();
-    const labeled = this.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='harness_identity'").get();
-    invariant(!prior || labeled, "HARNESS_SCHEMA_MISMATCH", "An existing non-modeling SQLite is not compatible");
     try {
+      ensureModelingDatabase(this.db);
       this.sessionId = transaction(this.db, () => {
         this.db.exec([
           "CREATE TABLE IF NOT EXISTS session_identity(session_id TEXT PRIMARY KEY);",

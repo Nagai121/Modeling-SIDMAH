@@ -1,21 +1,21 @@
-# Modeling SIDMAH v0.1.0
+# Modeling SIDMAH v0.1.1
 
 SIDMAH v2.0.2（親コミット `a85f66f626a4c2a00ef16909e59fc5a137fcad79`）のマルチエージェント実行基盤を継承し、3Dキャラクターモデリング専用に変更したハーネスです。独立した通常のGitHubリポジトリとして利用できます。変換スクリプトや元SIDMAHの別チェックアウトは不要です。
 
 ## 目標と入力
 
-**頭部・上半身（衣服込み）・下半身（衣服込み）・小物・全体の5対象 × 正面・側面・背面の3方向＝15枚の試料画像**を入力します。最終目標はDirectorの視認による試料画像との完全一致です。実際に確認していない一致を達成済みとして報告しません。
+**頭部・上半身（衣服込み）・下半身（衣服込み）・小物・全体の5区分 × 正面・側面・背面の3方向＝15の画像枠**を使います。画像は**最低1枚**あれば開始でき、残りの枠は空欄のままで構いません。最終目標はDirectorの視認による試料画像との完全一致です。実際に確認していない一致を達成済みとして報告しません。
 
-`modeling/reference_images/manifest.json`で側面が被写体の左右どちらのものか指定します。参照画像は`modeling/reference_images/<part>/<view>.png`等に配置します。part は `head`、`upper_body`、`lower_body`、`accessories`、`whole`、view は `front`、`side`、`back`です。
+`modeling/reference_images/manifest.json`の側面方向は任意で、既定値はありません。必要な場合だけ指定します。参照画像は`modeling/reference_images/<part>/<view>.png`等に配置します。part は `head`、`upper_body`、`lower_body`、`accessories`、`whole`、view は `front`、`side`、`back`です。
 
 ## 起動
 
 必要なもの：Node.js 24.10以降、CodexまたはOpenCode、必要に応じてBlender・Blender MCP・Tripo公式CLI/MCPなどの**既存ツール**。Pythonの画像検査は標準ライブラリ、重ね合わせスクリプトはPillowが必要です。Tripoの独自APIクライアントやAPIキー管理は実装していません。
 
 1. このリポジトリをそのままcloneし、プロジェクトルートでCodexまたはOpenCodeを開きます。
-2. `modeling/reference_images/` に15枚の試料画像を配置し、`manifest.json`の側面方向を確認します。
-3. `python scripts/validate_references.py modeling/reference_images` で画像構成を検査します。
-4. `AGENTS.md` を読み、Directorとして作業を開始させます。MCP設定は `.codex/config.toml` と `opencode.json` に収録されています。設定はプロジェクトルートからの相対パスです。
+2. `modeling/reference_images/` の15枠のいずれかに**最低1枚**の画像を配置します。側面方向は必要な場合のみ指定します。
+3. `python scripts/validate_references.py modeling/reference_images` で実際に配置した画像を検査します。
+4. `AGENTS.md` を読み、Directorとして入力画像を理解してからFCを実施します。FC Gate 2では検査用モデルを作りません。MCP設定は `.codex/config.toml` と `opencode.json` に収録されています。設定はプロジェクトルートからの相対パスです。
 5. Directorは`director_start`、`register_query`で作業を確定し、Cell・Workerへ`create_cell_assignment`と`create_start_assignment`で作業を割り当てます。
 6. Workerは対象の`works/cell_<n>/work_place/`へ完成モデルと画像を置き、`modeling-result.json`を書いて`submit_modeling_work`を呼びます。
 7. Resultを受け取ったWorkerが`create_end_assignment`、Directorが`complete_end_review`で成果物と参照画像を比較します。必要な修正は新しいAssignmentとして渡します。

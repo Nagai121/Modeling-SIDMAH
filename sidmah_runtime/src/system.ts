@@ -67,10 +67,10 @@ export class SidmahSystem {
     const output = unregistered ? this.cells.claimPendingCellAssignment(context.providerSessionId, assignmentId) : (this.cells.acknowledgeCellAssignment(context.sessionToken, assignmentId), { ok: true });
     await this.pump(); return output;
   }
-  async createStart(context: CallerContext, cellNo: number, meaning: unknown, timeoutMs?: number) {
+  async createStart(context: CallerContext, cellNo: number, meaning: unknown) {
     const query = this.runtimes.currentQuery();
     invariant(query, "QUERY_NOT_REGISTERED", "Register the agreed Query before creating Start");
-    const output = this.runtimes.createStartAssignment(context.sessionToken, cellNo, meaning, timeoutMs, query);
+    const output = this.runtimes.createStartAssignment(context.sessionToken, cellNo, meaning, query);
     await this.pump(); return { ...output, ...this.pendingDeliveries(context) };
   }
 
