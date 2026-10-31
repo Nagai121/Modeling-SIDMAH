@@ -68,7 +68,11 @@ else:
     print("WARNING: model-dependent framing; do not compare sizes unless --ortho-scale and --camera-center are shared")
 
 scene = bpy.context.scene
-scene.render.engine = "BLENDER_EEVEE_NEXT"
+try:
+    scene.render.engine = "BLENDER_EEVEE_NEXT"
+except TypeError:
+    # Blender <= 4.1 uses the previous Eevee engine name.
+    scene.render.engine = "BLENDER_EEVEE"
 scene.render.resolution_x = args.resolution
 scene.render.resolution_y = args.resolution
 scene.render.resolution_percentage = 100

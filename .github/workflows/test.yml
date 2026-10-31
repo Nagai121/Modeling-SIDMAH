@@ -1,7 +1,7 @@
 name: Modeling SIDMAH tests
 on:
   push:
-    branches: [main, v0.1.1-validation]
+    branches: [main, v0.1.2-validation]
   pull_request:
   workflow_dispatch:
 jobs:
@@ -18,13 +18,31 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
-      - name: Run offline runtime and MCP tests (no paid API)
+      - name: Node.js runtime, submission, MCP and image input tests
         working-directory: sidmah_runtime
         run: npm test
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Install reference-image crop dependency
+      - name: Install image utility dependency
         run: python -m pip install --disable-pip-version-check -r scripts/requirements.txt
-      - name: Reference input tests
+      - name: Image input and composite crop tests
         run: python -m unittest discover -s tests -p 'test_*.py' -v
+      - name: Python syntax checks
+        run: python -m py_compile scripts/blender_render_views.py scripts/validate_references.py scripts/split_reference_montage.py
+  blender-smoke:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Blender
+        run: sudo apt-get update -qq && sudo apt-get install -y blender
+      - name: Verify Blender can create a real mesh and save a .blend scene
+        run: blender -b --factory-startup --python tests/blender_smoke.py -- --out /tmp/modeling-smoke
+      - name: Render actual Blender scene from four orthographic directions
+        run: blender -b --factory-startup --python scripts/blender_render_views.py -- --input /tmp/modeling-smoke/mesh.blend --output /tmp/modeling-smoke/renders --resolution 96
+      - name: Check generated render files
+        run: |
+          test -s /tmp/modeling-smoke/mesh.blend
+          for direction in front back side_left side_right; do test -s "/tmp/modeling-smoke/renders/$direction.png"; done
