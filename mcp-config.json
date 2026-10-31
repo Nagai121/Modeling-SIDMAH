@@ -1,0 +1,11 @@
+{
+  "serverName": "modeling_sidmah",
+  "command": "node",
+  "nodeArgs": [
+    "--experimental-strip-types"
+  ],
+  "enabled": true,
+  "required": false,
+  "startupTimeoutSec": 30,
+  "toolTimeoutSec": 300
+}

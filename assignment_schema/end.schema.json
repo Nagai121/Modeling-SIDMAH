@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Modeling End meaning",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "producedArtifacts",
+    "outputAudit",
+    "visualDifferences",
+    "unresolvedIssues",
+    "revisionAdvice",
+    "referenceEvidence"
+  ],
+  "properties": {
+    "producedArtifacts": {
+      "type": "string",
+      "minLength": 1
+    },
+    "outputAudit": {
+      "type": "string",
+      "minLength": 1
+    },
+    "visualDifferences": {
+      "type": "string",
+      "minLength": 1
+    },
+    "unresolvedIssues": {
+      "type": "string",
+      "minLength": 1
+    },
+    "revisionAdvice": {
+      "type": "string",
+      "minLength": 1
+    },
+    "referenceEvidence": {
+      "type": "string",
+      "minLength": 1
+    }
+  }
+}

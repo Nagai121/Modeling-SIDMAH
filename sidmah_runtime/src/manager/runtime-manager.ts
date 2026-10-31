@@ -1,0 +1,714 @@
+import { spawnSync } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
+import { chmodSync, closeSync, copyFileSync, cpSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, renameSync, rmSync } from "node:fs";
+import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
+import type { DatabaseSync } from "node:sqlite";
+import { openDb, json, parseJson, transaction } from "../core/db.ts";
+import { invariant } from "../core/errors.ts";
+import { MachineLog } from "../core/machine-log.ts";
+import type { EndMeaning, ProviderHarness } from "../core/types.ts";
+import { endMeaning, startMeaning } from "../core/validation.ts";
+import type { CellManager } from "./cell-manager.ts";
+import { writeFixedResult } from "../runtime/fixed-result.ts";
+import { ensureModelingDatabase } from "../core/harness-identity.ts";
+
+type FixedResult = { resultRef: string; resultHash: string; manifestRef?: string; executionStatus: string };
+export type QueryContext = { queryNo: number; revisionNo: number };
+
+export class RuntimeManager {
+  readonly db: DatabaseSync;
+  readonly log: MachineLog;
+  readonly root: string;
+  readonly cells: CellManager;
+  readonly provider: ProviderHarness;
+  private readonly deliveryRetries = new Map<string, number>();
+  private readonly deliveryRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly receiptChecks = new Map<string, number>();
+  private readonly receiptTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly receiptDeliveryIds = new Map<string, string>();
+  private readonly receiptInFlight = new Set<string>();
+  private closed = false;
+  constructor(root: string, cells: CellManager, provider: ProviderHarness) {
+    this.root = root; this.cells = cells; this.provider = provider;
+    this.db = openDb(resolve(root, "state", "runtime_management.sqlite"));
+    ensureModelingDatabase(this.db);
+    this.log = new MachineLog(resolve(root, "state", "runtime_management-log.txt"));
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS query_context(singleton INTEGER PRIMARY KEY CHECK(singleton=1),query_no INTEGER NOT NULL,revision_no INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS runtime_queries(runtime_id TEXT PRIMARY KEY,query_no INTEGER NOT NULL,revision_no INTEGER NOT NULL,created_at INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS runtime_counters(cell_no INTEGER PRIMARY KEY,value INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS sequence_counter(singleton INTEGER PRIMARY KEY CHECK(singleton=1),value INTEGER NOT NULL);
+      INSERT OR IGNORE INTO sequence_counter VALUES(1,0);
+      CREATE TABLE IF NOT EXISTS starts(
+        start_id TEXT PRIMARY KEY,runtime_id TEXT NOT NULL UNIQUE,cell_no INTEGER NOT NULL,runtime_no INTEGER NOT NULL,
+        meaning_json TEXT NOT NULL,state TEXT NOT NULL CHECK(state IN('dispatch_pending','inbox_registered','completed')),
+        created_at INTEGER NOT NULL,UNIQUE(cell_no,runtime_no)
+      );
+      CREATE TABLE IF NOT EXISTS runtimes(
+        runtime_id TEXT PRIMARY KEY,cell_no INTEGER NOT NULL,runtime_no INTEGER NOT NULL,state TEXT NOT NULL CHECK(state IN('created','launching','running','finished')),
+        timeout_ms INTEGER NOT NULL,snapshot_state TEXT NOT NULL,archive_state TEXT NOT NULL,cleanup_state TEXT NOT NULL,
+        executor_token TEXT,executor_pid INTEGER,result_ref TEXT,result_hash TEXT,execution_status TEXT,state_version INTEGER NOT NULL DEFAULT 0,
+        snapshot_temporary_path TEXT,snapshot_source_path TEXT,snapshot_destination_path TEXT,snapshot_source_hash TEXT,
+        snapshot_failure_class TEXT,snapshot_diagnostics_json TEXT,archive_diagnostics_json TEXT,
+        UNIQUE(cell_no,runtime_no)
+      );
+      CREATE TABLE IF NOT EXISTS ends(
+        runtime_id TEXT PRIMARY KEY,end_assignment_id TEXT UNIQUE,state TEXT NOT NULL CHECK(state IN('meaning_pending','director_pending','submitting','submitted','active','completed')),
+        sequence INTEGER UNIQUE,meaning_json TEXT,delivery_id TEXT UNIQUE,created_at INTEGER NOT NULL,completed_at INTEGER
+      );
+      CREATE TABLE IF NOT EXISTS result_contexts(
+        context_id TEXT PRIMARY KEY,runtime_id TEXT NOT NULL UNIQUE,state TEXT NOT NULL CHECK(state IN('dispatch_pending','inbox_registered','consumed')),
+        created_at INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS worker_dispatch(
+        source_id TEXT PRIMARY KEY,kind TEXT NOT NULL CHECK(kind IN('start','result')),cell_no INTEGER NOT NULL,payload_json TEXT NOT NULL,
+        priority INTEGER NOT NULL,state TEXT NOT NULL CHECK(state IN('pending','registered')),created_at INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS director_inbox(
+        item_id TEXT PRIMARY KEY,runtime_id TEXT NOT NULL UNIQUE,payload_json TEXT NOT NULL,state TEXT NOT NULL,
+        delivery_id TEXT NOT NULL UNIQUE,target_run_id TEXT,target_provider_session_id TEXT,created_at INTEGER NOT NULL,last_error TEXT
+      );
+      CREATE TABLE IF NOT EXISTS director_slots(run_id TEXT PRIMARY KEY,item_id TEXT NOT NULL UNIQUE,phase TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS director_delivery_attempts(
+        delivery_id TEXT PRIMARY KEY,item_id TEXT NOT NULL,target_session_id TEXT NOT NULL,created_at INTEGER NOT NULL
+      );
+    `);
+    const runtimeColumns = this.db.prepare("PRAGMA table_info(runtimes)").all() as any[];
+    if (!runtimeColumns.some(column => column.name === "executor_pid")) this.db.exec("ALTER TABLE runtimes ADD COLUMN executor_pid INTEGER");
+    for (const [name, type] of [
+      ["snapshot_temporary_path", "TEXT"], ["snapshot_source_path", "TEXT"], ["snapshot_destination_path", "TEXT"],
+      ["snapshot_source_hash", "TEXT"], ["snapshot_failure_class", "TEXT"], ["snapshot_diagnostics_json", "TEXT"],
+      ["archive_diagnostics_json", "TEXT"],
+    ]) if (!runtimeColumns.some(column => column.name === name)) this.db.exec(`ALTER TABLE runtimes ADD COLUMN ${name} ${type}`);
+  }
+
+  rememberQuery(query: QueryContext): void {
+    transaction(this.db, () => this.db.prepare("INSERT INTO query_context VALUES(1,?,?) ON CONFLICT(singleton) DO UPDATE SET query_no=excluded.query_no,revision_no=excluded.revision_no").run(query.queryNo, query.revisionNo));
+  }
+
+  currentQuery(): QueryContext | undefined {
+    const row = this.db.prepare("SELECT query_no,revision_no FROM query_context WHERE singleton=1").get() as any;
+    return row && { queryNo: row.query_no, revisionNo: row.revision_no };
+  }
+
+  createStartAssignment(sessionToken: string, cellNo: number, rawMeaning: unknown, timeoutMs?: number, query?: QueryContext): { startId: string; runtimeId: string; runtimeNo: number } {
+    const meaning = startMeaning(rawMeaning);
+    const caller = this.cells.caller(sessionToken);
+    invariant(caller.kind === "director" && caller.status === "active", "DIRECTOR_NOT_ACTIVE", "Only the active Director may create Start");
+    invariant(timeoutMs === undefined || (Number.isSafeInteger(timeoutMs) && timeoutMs > 0), "TIMEOUT_INVALID", "Runtime timeout must be a positive integer when specified");
+    invariant(this.cells.currentBinding(cellNo), "CELL_HAS_NO_WORKER", "Cell has no active Worker");
+    const output = transaction(this.db, () => {
+      this.db.prepare("INSERT OR IGNORE INTO runtime_counters VALUES(?,0)").run(cellNo);
+      this.db.prepare("UPDATE runtime_counters SET value=value+1 WHERE cell_no=?").run(cellNo);
+      const runtimeNo = Number((this.db.prepare("SELECT value FROM runtime_counters WHERE cell_no=?").get(cellNo) as any).value);
+      const startId = randomUUID(), runtimeId = randomUUID();
+      this.db.prepare("INSERT INTO starts VALUES(?,?,?,?,?,'dispatch_pending',?)").run(startId, runtimeId, cellNo, runtimeNo, json(meaning), Date.now());
+      this.db.prepare("INSERT INTO runtimes(runtime_id,cell_no,runtime_no,state,timeout_ms,snapshot_state,archive_state,cleanup_state) VALUES(?,?,?,'created',?,'none','pending','pending')").run(runtimeId, cellNo, runtimeNo, timeoutMs ?? 0);
+      this.db.prepare("INSERT INTO worker_dispatch VALUES(?,'start',?,?,30,'pending',?)").run(startId, cellNo, json({ startId, runtimeId, runtimeNo, cellNo, meaning }), Date.now());
+      if (query) this.db.prepare("INSERT INTO runtime_queries VALUES(?,?,?,?)").run(runtimeId, query.queryNo, query.revisionNo, Date.now());
+      return { startId, runtimeId, runtimeNo };
+    });
+    this.log.write("start_committed", output);
+    return output;
+  }
+
+  drainWorkerDispatch(): number {
+    const rows = this.db.prepare("SELECT * FROM worker_dispatch WHERE state='pending' ORDER BY priority,created_at").all() as any[];
+    let count = 0;
+    for (const row of rows) {
+      try {
+        this.cells.enqueueWorkerItem(row.cell_no, row.kind, row.source_id, parseJson(row.payload_json), row.priority);
+        transaction(this.db, () => {
+          this.db.prepare("UPDATE worker_dispatch SET state='registered' WHERE source_id=? AND state='pending'").run(row.source_id);
+          if (row.kind === "start") this.db.prepare("UPDATE starts SET state='inbox_registered' WHERE start_id=? AND state='dispatch_pending'").run(row.source_id);
+          else this.db.prepare("UPDATE result_contexts SET state='inbox_registered' WHERE context_id=? AND state='dispatch_pending'").run(row.source_id);
+        });
+        count++;
+      } catch (error: any) {
+        if (error?.code !== "CELL_HAS_NO_WORKER") throw error;
+      }
+    }
+    return count;
+  }
+
+  private validateModelingOutput(folder: string): { primaryModel: string; previewImages: string[]; otherFiles: string[]; notes?: string } {
+    const path = resolve(folder, "modeling-result.json");
+    invariant(existsSync(path), "MODEL_RESULT_MISSING", "Work Place must contain modeling-result.json");
+    const result = JSON.parse(readFileSync(path, "utf8"));
+    invariant(result && result.schemaVersion === 1 && typeof result.primaryModel === "string"
+      && Array.isArray(result.previewImages) && Array.isArray(result.otherFiles),
+      "MODEL_RESULT_INVALID", "modeling-result.json is invalid");
+    const all = [result.primaryModel, ...result.previewImages, ...result.otherFiles];
+    invariant(all.every((p: unknown) => typeof p === "string" && p.length > 0),
+      "MODEL_PATH_INVALID", "Artifact paths must be non-empty strings");
+    invariant(new Set(all).size === all.length, "MODEL_PATH_DUPLICATE", "Duplicate artifact paths");
+    for (const p of all) {
+      invariant(!isAbsolute(p) && !p.split(/[\\/]/).includes(".."), "MODEL_PATH_ESCAPE", "Artifact path escapes Work Place");
+      const abs = resolve(folder, p), rel = relative(folder, abs);
+      invariant(rel !== ".." && !rel.startsWith(".." + sep) && !isAbsolute(rel), "MODEL_PATH_ESCAPE", "Artifact path escapes Work Place");
+      let cursor = folder;
+      for (const component of rel.split(sep)) {
+        cursor = resolve(cursor, component);
+        invariant(existsSync(cursor) && !lstatSync(cursor).isSymbolicLink(), "MODEL_PATH_SYMLINK", "Symlink or missing artifact");
+      }
+      invariant(lstatSync(abs).isFile() && lstatSync(abs).size > 0, "MODEL_ARTIFACT_INVALID", "Artifact is missing or empty");
+    }
+    invariant(/\.(blend|glb|gltf|fbx|obj)$/i.test(result.primaryModel), "MODEL_FORMAT_INVALID", "Unsupported primary model type");
+    invariant(result.previewImages.every((p: string) => /\.(png|jpg|jpeg|webp)$/i.test(p)),
+      "MODEL_PREVIEW_INVALID", "Preview images must be images");
+    return result;
+  }
+
+  private freezeSnapshot(path: string): void {
+    const stat = lstatSync(path);
+    if (stat.isDirectory()) {
+      for (const name of readdirSync(path)) this.freezeSnapshot(resolve(path, name));
+    }
+    try { chmodSync(path, stat.mode & ~0o222); } catch {}
+  }
+
+  private makeWritable(path: string): void {
+    if (!existsSync(path)) return;
+    const stat = lstatSync(path);
+    if (stat.isDirectory()) for (const name of readdirSync(path)) this.makeWritable(resolve(path, name));
+    try { chmodSync(path, stat.mode | 0o200); } catch {}
+  }
+
+  private removeSnapshot(path: string): void {
+    this.makeWritable(path);
+    rmSync(path, { recursive: true, force: true });
+  }
+
+  private runtimeDirectory(runtime: { cell_no: number; runtime_no: number }): string {
+    return resolve(this.root, "works", `cell_${runtime.cell_no}`, `runtime_${runtime.runtime_no}`);
+  }
+
+  private fileHash(file: string): string {
+    const hash = createHash("sha256"), fd = openSync(file, "r");
+    const buffer = Buffer.allocUnsafe(1024 * 1024);
+    try {
+      for (;;) {
+        const n = readSync(fd, buffer, 0, buffer.length, null);
+        if (n === 0) break;
+        hash.update(buffer.subarray(0, n));
+      }
+    } finally { closeSync(fd); }
+    return hash.digest("hex");
+  }
+
+  private treeManifest(root: string): { hash: string; entries: Array<Record<string, unknown>> } {
+    const entries: Array<Record<string, unknown>> = [];
+    const visit = (path: string, relative: string): void => {
+      const stat = lstatSync(path);
+      invariant(!stat.isSymbolicLink(), "SNAPSHOT_SYMLINK", "Symlink is forbidden in modeling Work Place");
+      if (stat.isDirectory()) {
+        entries.push({ path: relative || ".", type: "directory", mode: stat.mode, size: stat.size });
+        for (const name of readdirSync(path).sort()) visit(resolve(path, name), relative ? `${relative}/${name}` : name);
+      } else {
+        entries.push({ path: relative, type: "file", mode: stat.mode, size: stat.size, sha256: this.fileHash(path) });
+      }
+    };
+    visit(root, "");
+    return { hash: createHash("sha256").update(json(entries)).digest("hex"), entries };
+  }
+
+  private aclSummary(path: string): Record<string, unknown> {
+    if (process.platform !== "win32") return { platform: process.platform, available: false };
+    try {
+      const result = spawnSync("icacls", [path], { encoding: "utf8", windowsHide: true, timeout: 5_000 });
+      return { platform: "win32", available: result.status === 0, status: result.status, stdout: result.stdout?.slice(0, 16_384), stderr: result.stderr?.slice(0, 4_096) };
+    } catch (error) { return { platform: "win32", available: false, error: String(error) }; }
+  }
+
+  private classifySnapshotFailure(error: any, source: string, destination: string): string {
+    if (existsSync(destination)) return "destination_exists";
+    if (!existsSync(source)) return "invalid_source_tree";
+    if (["EACCES", "EROFS"].includes(error?.code)) return "access_or_acl";
+    if (["EBUSY", "ENOTEMPTY"].includes(error?.code)) return "transient_lock";
+    if (error?.code === "EPERM") return process.platform === "win32" ? "unknown_windows_lock" : "access_or_acl";
+    return "unknown";
+  }
+
+  private async commitSnapshot(runtimeId: string, temporary: string, snapshot: string, workPlace: string, sourceHash: string): Promise<void> {
+    const attempts: Array<Record<string, unknown>> = [];
+    const waits = [0, 50, 100, 250, 500];
+    transaction(this.db, () => this.db.prepare(`UPDATE runtimes SET snapshot_state='commit_pending',snapshot_temporary_path=?,snapshot_source_path=?,snapshot_destination_path=?,snapshot_source_hash=?,snapshot_failure_class=NULL,snapshot_diagnostics_json=? WHERE runtime_id=?`).run(temporary, workPlace, snapshot, sourceHash, json({ manifest: this.treeManifest(temporary) }), runtimeId));
+    for (let index = 0; index < waits.length; index++) {
+      if (waits[index]) await delay(waits[index]);
+      const attemptedAt = Date.now();
+      try {
+        renameSync(temporary, snapshot);
+        attempts.push({ attempt: index + 1, attemptedAt, ok: true });
+        return;
+      } catch (error: any) {
+        attempts.push({ attempt: index + 1, attemptedAt, ok: false, code: error?.code, errno: error?.errno, message: String(error) });
+        if (!["EPERM", "EBUSY", "ENOTEMPTY"].includes(error?.code) || index === waits.length - 1) {
+          const failureClass = this.classifySnapshotFailure(error, temporary, snapshot);
+          const diagnostics = { failureClass, code: error?.code, errno: error?.errno, message: String(error), attempts, temporaryPath: temporary, sourcePath: workPlace, destinationPath: snapshot, sourceHash, manifest: this.treeManifest(temporary), attributes: lstatSync(temporary), acl: this.aclSummary(temporary), recordedAt: Date.now() };
+          transaction(this.db, () => this.db.prepare("UPDATE runtimes SET snapshot_state='commit_failed',snapshot_failure_class=?,snapshot_diagnostics_json=? WHERE runtime_id=?").run(failureClass, json(diagnostics), runtimeId));
+          this.log.write("snapshot_commit_failed", { runtimeId, ...diagnostics });
+          throw error;
+        }
+      }
+    }
+  }
+
+  async submitModelingWork(sessionToken: string): Promise<{ runtimeId: string; snapshotDirectory: string }> {
+    const item = this.cells.claimWorkerItemForMcpCall(sessionToken, "start");
+    const startId = item.source_id;
+    const start = this.db.prepare("SELECT * FROM starts WHERE start_id=?").get(startId) as any;
+    invariant(start && start.state === "inbox_registered", "START_NOT_ACTIVE", "Start is not ready for Starter");
+    const binding = this.cells.validateWorker(start.cell_no, sessionToken);
+    const runtime = this.db.prepare("SELECT * FROM runtimes WHERE runtime_id=?").get(start.runtime_id) as any;
+    invariant(runtime?.state === "created", "RUNTIME_START_CONFLICT", "Runtime is not in created state");
+    const workPlace = resolve(this.root, "works", `cell_${start.cell_no}`, "work_place");
+    invariant(existsSync(workPlace), "WORK_PLACE_MISSING", "Cell Work Place does not exist");
+    const runtimeDir = this.runtimeDirectory(start);
+    const snapshot = resolve(runtimeDir, `snapshot-${start.runtime_no}`);
+    mkdirSync(runtimeDir, { recursive: true });
+    this.validateModelingOutput(workPlace);
+    let current = this.db.prepare("SELECT * FROM runtimes WHERE runtime_id=?").get(runtime.runtime_id) as any;
+    let temporary = ["commit_failed", "commit_pending"].includes(current.snapshot_state) ? current.snapshot_temporary_path : undefined;
+    const sourceHash = this.treeManifest(workPlace).hash;
+    if (!temporary || !existsSync(temporary) || current.snapshot_source_hash !== sourceHash) {
+      temporary = `${snapshot}.${randomUUID()}.tmp`;
+      transaction(this.db, () => this.db.prepare("UPDATE runtimes SET snapshot_state='copying',snapshot_temporary_path=?,snapshot_source_path=?,snapshot_destination_path=?,snapshot_source_hash=? WHERE runtime_id=?").run(temporary, workPlace, snapshot, sourceHash, runtime.runtime_id));
+      try {
+        cpSync(workPlace, temporary, { recursive: true, errorOnExist: true });
+      } catch (error) {
+        this.removeSnapshot(temporary);
+        transaction(this.db, () => this.db.prepare("UPDATE runtimes SET snapshot_state='none',snapshot_temporary_path=NULL WHERE runtime_id=? AND state='created' AND snapshot_state='copying' AND snapshot_temporary_path=?").run(runtime.runtime_id, temporary));
+        throw error;
+      }
+    }
+    this.validateModelingOutput(temporary);
+    await this.commitSnapshot(runtime.runtime_id, temporary, snapshot, workPlace, sourceHash);
+    this.freezeSnapshot(snapshot);
+    const executorToken = randomUUID();
+    try {
+      this.cells.withWorkerCommitFence(start.cell_no, sessionToken, "start", startId, binding.fence, () => {
+        transaction(this.db, () => {
+          const result = this.db.prepare("UPDATE runtimes SET state='launching',snapshot_state='fixed',executor_token=?,snapshot_failure_class=NULL,state_version=state_version+1 WHERE runtime_id=? AND state='created'").run(executorToken, runtime.runtime_id);
+          invariant(result.changes === 1, "RUNTIME_START_CONFLICT", "Runtime was started concurrently");
+          this.db.prepare("UPDATE starts SET state='completed' WHERE start_id=?").run(startId);
+        });
+      });
+    } catch (error) {
+      const current = this.db.prepare("SELECT state FROM runtimes WHERE runtime_id=?").get(runtime.runtime_id) as any;
+      if (current?.state === "created" && existsSync(snapshot)) {
+        this.removeSnapshot(snapshot);
+        transaction(this.db, () => this.db.prepare("UPDATE runtimes SET snapshot_state='none',snapshot_temporary_path=NULL,snapshot_failure_class=NULL,snapshot_diagnostics_json=NULL WHERE runtime_id=? AND state='created'").run(runtime.runtime_id));
+      }
+      throw error;
+    }
+    this.cells.completeItemBySource("start", startId);
+    await this.completeModelingRuntime(runtime.runtime_id);
+    this.log.write("modeling_work_submitted", { runtimeId: runtime.runtime_id, snapshot });
+    return { runtimeId: runtime.runtime_id, snapshotDirectory: snapshot };
+  }
+
+  private async completeModelingRuntime(runtimeId: string): Promise<void> {
+    const runtime = this.db.prepare("SELECT * FROM runtimes WHERE runtime_id=?").get(runtimeId) as any;
+    if (!runtime || runtime.state === "finished") return;
+    invariant(runtime.state === "launching", "MODELING_STATE_INVALID", "Runtime must be launching");
+    const dir = this.runtimeDirectory(runtime), snapshot = resolve(dir, `snapshot-${runtime.runtime_no}`);
+    const declared = this.validateModelingOutput(snapshot);
+    const artifacts = [declared.primaryModel, ...declared.previewImages, ...declared.otherFiles];
+    const copied: Array<{ path: string; sha256: string; bytes: number }> = [];
+    for (const rel of artifacts) {
+      const src = resolve(snapshot, rel), dest = resolve(dir, "artifacts", rel);
+      mkdirSync(dirname(dest), { recursive: true });
+      const sha256 = this.fileHash(src);
+      if (existsSync(dest)) invariant(this.fileHash(dest) === sha256,
+        "MODEL_ARTIFACT_COLLISION", "Existing fixed artifact differs from Snapshot");
+      else {
+        const temporary = `${dest}.${randomUUID()}.tmp`;
+        copyFileSync(src, temporary);
+        renameSync(temporary, dest);
+        invariant(this.fileHash(dest) === sha256, "MODEL_ARTIFACT_HASH", "Copied model differs from frozen source");
+      }
+      copied.push({ path: rel, sha256, bytes: lstatSync(src).size });
+    }
+    const result = { schemaVersion: 1, executionStatus: "success", type: "modeling",
+      primaryModel: declared.primaryModel, previewImages: declared.previewImages,
+      otherFiles: declared.otherFiles, notes: declared.notes ?? "", artifacts: copied };
+    this.finishResult(runtimeId, () => ({
+      ...writeFixedResult(dir, runtimeId, result), executionStatus: "success",
+    }));
+    this.drainWorkerDispatch();
+    try { await this.cells.dispatchNextForCell(runtime.cell_no); }
+    catch (error) { this.log.write("result_delivery_failed", { runtimeId, cellNo: runtime.cell_no, error: String(error) }); }
+    await this.archive(runtimeId);
+  }
+
+  private readFilesystemResult(runtime: any): FixedResult | undefined {
+    const dir = this.runtimeDirectory(runtime);
+    const resultRef = resolve(dir, "result.json"), manifestRef = resolve(dir, "result.manifest.json");
+    try {
+      const manifest = JSON.parse(readFileSync(manifestRef, "utf8"));
+      const body = readFileSync(resultRef, "utf8");
+      const hash = createHash("sha256").update(body).digest("hex");
+      const result = JSON.parse(body);
+      if (manifest.complete === true && manifest.runtimeId === runtime.runtime_id && manifest.resultHash === hash) {
+        return { resultRef, resultHash: hash, manifestRef, executionStatus: String(result.executionStatus) };
+      }
+    } catch {}
+    return undefined;
+  }
+
+  private recoverOneFilesystemResult(runtime: any): boolean {
+    return this.finishResult(runtime.runtime_id, current => this.readFilesystemResult(current));
+  }
+
+  // BEGIN IMMEDIATE serializes publication as well as DB completion across processes.
+  // Keep prepare synchronous: an unfinished Runtime must never publish outside this transaction.
+  private finishResult(runtimeId: string, prepare: (runtime: any) => FixedResult | undefined): boolean {
+    const fixed = transaction(this.db, () => {
+      const runtime = this.db.prepare("SELECT * FROM runtimes WHERE runtime_id=?").get(runtimeId) as any;
+      if (!runtime || runtime.state === "finished") return undefined;
+      const result = prepare(runtime);
+      if (!result) return undefined;
+      const contextId = randomUUID();
+      this.db.prepare("UPDATE runtimes SET state='finished',result_ref=?,result_hash=?,execution_status=?,state_version=state_version+1 WHERE runtime_id=?").run(result.resultRef, result.resultHash, result.executionStatus, runtimeId);
+      this.db.prepare("INSERT INTO ends(runtime_id,state,created_at) VALUES(?,'meaning_pending',?)").run(runtimeId, Date.now());
+      this.db.prepare("INSERT INTO result_contexts VALUES(?,?,'dispatch_pending',?)").run(contextId, runtimeId, Date.now());
+      this.db.prepare("INSERT INTO worker_dispatch VALUES(?,'result',?,?,10,'pending',?)").run(contextId, runtime.cell_no, json({ contextId, runtimeId, resultRef: result.resultRef }), Date.now());
+      return result;
+    });
+    if (fixed) this.log.write("runtime_finished", { runtimeId, resultRef: fixed.resultRef, executionStatus: fixed.executionStatus });
+    return fixed !== undefined;
+  }
+
+  commitFixedResult(runtimeId: string, fixed: { resultRef: string; resultHash: string; manifestRef?: string }, executionStatus: string): void {
+    invariant(this.finishResult(runtimeId, () => ({ ...fixed, executionStatus })), "RUNTIME_ALREADY_FINISHED", "Runtime is already finished");
+  }
+
+  createEndAssignment(sessionToken: string, rawMeaning: unknown): { endAssignmentId: string; sequence: number } {
+    const meaning = endMeaning(rawMeaning);
+    const item = this.cells.claimWorkerItemForMcpCall(sessionToken, "result");
+    const contextId = item.source_id;
+    const context = this.db.prepare("SELECT c.*,r.cell_no FROM result_contexts c JOIN runtimes r ON r.runtime_id=c.runtime_id WHERE c.context_id=?").get(contextId) as any;
+    invariant(context && context.state === "inbox_registered", "RESULT_CONTEXT_INVALID", "Active Result context is not available");
+    this.cells.validateWorker(context.cell_no, sessionToken);
+    const output = transaction(this.db, () => {
+      const end = this.db.prepare("SELECT * FROM ends WHERE runtime_id=?").get(context.runtime_id) as any;
+      invariant(end?.state === "meaning_pending" && end.end_assignment_id === null, "END_ALREADY_ASSIGNED", "End meaning is already assigned");
+      this.db.prepare("UPDATE sequence_counter SET value=value+1 WHERE singleton=1").run();
+      const sequence = Number((this.db.prepare("SELECT value FROM sequence_counter WHERE singleton=1").get() as any).value), endAssignmentId = randomUUID(), deliveryId = randomUUID();
+      this.db.prepare("UPDATE ends SET end_assignment_id=?,state='director_pending',sequence=?,meaning_json=?,delivery_id=? WHERE runtime_id=? AND state='meaning_pending'").run(endAssignmentId, sequence, json(meaning), deliveryId, context.runtime_id);
+      this.db.prepare("UPDATE result_contexts SET state='consumed' WHERE context_id=? AND state='inbox_registered'").run(contextId);
+      this.db.prepare("INSERT INTO director_inbox VALUES(?,?,?,'pending',?,NULL,NULL,?,NULL)").run(randomUUID(), context.runtime_id, json({ endAssignmentId, sequence, runtimeId: context.runtime_id, meaning }), deliveryId, Date.now());
+      return { endAssignmentId, sequence };
+    });
+    this.cells.completeWorkerItem(sessionToken, "result", contextId);
+    this.log.write("end_meaning_committed", { runtimeId: context.runtime_id, ...output });
+    return output;
+  }
+
+  async dispatchNextDirector(): Promise<string | undefined> {
+    const director = this.cells.activeDirector(); if (!director) return undefined;
+    const claim = transaction(this.db, () => {
+      const slot = this.db.prepare("SELECT item_id,phase FROM director_slots WHERE run_id=?").get(director.runId) as any;
+      if (slot && slot.phase !== "submitting") return undefined;
+      const item = slot
+        ? this.db.prepare("SELECT * FROM director_inbox WHERE item_id=? AND state='submitting'").get(slot.item_id) as any
+        : this.db.prepare("SELECT * FROM director_inbox WHERE state='pending' ORDER BY (SELECT sequence FROM ends WHERE runtime_id=director_inbox.runtime_id),created_at LIMIT 1").get() as any;
+      if (!item) return undefined;
+      if (!slot) {
+        const deliveryId = item.target_provider_session_id === director.providerSessionId ? item.delivery_id : randomUUID();
+        this.db.prepare("UPDATE director_inbox SET state='submitting',delivery_id=?,target_run_id=?,target_provider_session_id=?,last_error=NULL WHERE item_id=?").run(deliveryId, director.runId, director.providerSessionId, item.item_id);
+        this.db.prepare("INSERT INTO director_slots VALUES(?,?,'submitting')").run(director.runId, item.item_id);
+        this.db.prepare("UPDATE ends SET state='submitting' WHERE runtime_id=? AND state='director_pending'").run(item.runtime_id);
+        this.db.prepare("UPDATE ends SET delivery_id=? WHERE runtime_id=?").run(deliveryId, item.runtime_id);
+        this.db.prepare("INSERT OR IGNORE INTO director_delivery_attempts VALUES(?,?,?,?)").run(deliveryId, item.item_id, director.providerSessionId, Date.now());
+        item.delivery_id = deliveryId;
+      }
+      return { ...item, target_run_id: director.runId, target_provider_session_id: director.providerSessionId };
+    });
+    if (!claim) return undefined;
+    try {
+      const result = await this.provider.deliver({ deliveryId: claim.delivery_id, providerSessionId: claim.target_provider_session_id, kind: "end", payload: parseJson(claim.payload_json) });
+      invariant(result.accepted, "PROVIDER_REJECTED", "Provider rejected End delivery");
+      transaction(this.db, () => {
+        const state = result.processingStarted ? "active" : "submitted";
+        this.db.prepare("UPDATE director_inbox SET state=? WHERE item_id=? AND state='submitting'").run(state, claim.item_id);
+        this.db.prepare("UPDATE director_slots SET phase=? WHERE item_id=? AND phase='submitting'").run(state, claim.item_id);
+        this.db.prepare("UPDATE ends SET state=? WHERE runtime_id=? AND state='submitting'").run(state, claim.runtime_id);
+      });
+      this.deliveryRetries.delete(claim.item_id);
+      const timer = this.deliveryRetryTimers.get(claim.item_id);
+      if (timer) clearTimeout(timer);
+      this.deliveryRetryTimers.delete(claim.item_id);
+      if ((this.db.prepare("SELECT state FROM director_inbox WHERE item_id=?").get(claim.item_id) as any)?.state === "submitted") this.scheduleReceiptCheck(claim.item_id);
+      return claim.item_id;
+    } catch (error) {
+      transaction(this.db, () => {
+        this.db.prepare("DELETE FROM director_slots WHERE item_id=? AND phase='submitting'").run(claim.item_id);
+        this.db.prepare("UPDATE director_inbox SET state='pending',last_error=? WHERE item_id=? AND state='submitting'").run(String(error), claim.item_id);
+        this.db.prepare("UPDATE ends SET state='director_pending' WHERE runtime_id=? AND state='submitting'").run(claim.runtime_id);
+      });
+      const attempts = (this.deliveryRetries.get(claim.item_id) ?? 0) + 1;
+      this.deliveryRetries.set(claim.item_id, attempts);
+      if (attempts <= 3 && !this.deliveryRetryTimers.has(claim.item_id)) {
+        const delayMs = [2_000, 10_000, 30_000][attempts - 1];
+        const timer = setTimeout(() => {
+          this.deliveryRetryTimers.delete(claim.item_id);
+          void this.dispatchNextDirector().catch(retryError =>
+            this.log.write("director_delivery_retry_failed", { itemId: claim.item_id, attempt: attempts, error: String(retryError) }));
+        }, delayMs);
+        this.deliveryRetryTimers.set(claim.item_id, timer);
+      }
+      throw error;
+    }
+  }
+
+  private scheduleReceiptCheck(itemId: string): void {
+    if (!this.provider.redeliver || this.receiptTimers.has(itemId)) return;
+    const deliveryId = (this.db.prepare("SELECT delivery_id FROM director_inbox WHERE item_id=?").get(itemId) as any)?.delivery_id;
+    if (!deliveryId) return;
+    if (this.receiptDeliveryIds.get(itemId) !== deliveryId) {
+      this.receiptChecks.delete(itemId);
+      this.receiptDeliveryIds.set(itemId, deliveryId);
+    }
+    const attempt = this.receiptChecks.get(itemId) ?? 0;
+    if (attempt >= 3) return;
+    const timer = setTimeout(() => {
+      this.receiptTimers.delete(itemId);
+      void this.checkUnacknowledgedDirector(itemId).catch(error =>
+        this.log.write("director_receipt_check_failed", { itemId, error: String(error) }));
+    }, [300_000, 900_000, 1_800_000][attempt]);
+    this.receiptTimers.set(itemId, timer);
+  }
+
+  async checkUnacknowledgedDirector(itemId: string): Promise<void> {
+    if (this.closed || this.receiptInFlight.has(itemId)) return;
+    const item = this.db.prepare("SELECT * FROM director_inbox WHERE item_id=? AND state='submitted'").get(itemId) as any;
+    if (!item || !this.provider.redeliver) return;
+    if (this.receiptDeliveryIds.get(itemId) !== item.delivery_id) {
+      this.receiptChecks.delete(itemId);
+      this.receiptDeliveryIds.set(itemId, item.delivery_id);
+    }
+    const director = this.cells.activeDirector();
+    if (!director || director.runId !== item.target_run_id || director.providerSessionId !== item.target_provider_session_id) return;
+    const attempt = (this.receiptChecks.get(itemId) ?? 0) + 1;
+    if (attempt > 3) return;
+    this.receiptChecks.set(itemId, attempt);
+    this.receiptInFlight.add(itemId);
+    try {
+      await this.provider.redeliver({ deliveryId: item.delivery_id, providerSessionId: item.target_provider_session_id, kind: "end", payload: parseJson(item.payload_json) });
+      this.log.write("director_receipt_retry_sent", { itemId, deliveryId: item.delivery_id, attempt });
+    } catch (error) {
+      this.log.write("director_receipt_retry_failed", { itemId, deliveryId: item.delivery_id, attempt, error: String(error) });
+    } finally {
+      this.receiptInFlight.delete(itemId);
+    }
+    if (this.closed) return;
+    if ((this.db.prepare("SELECT state FROM director_inbox WHERE item_id=?").get(itemId) as any)?.state === "submitted") this.scheduleReceiptCheck(itemId);
+  }
+
+  private clearReceiptCheck(itemId: string): void {
+    const timer = this.receiptTimers.get(itemId);
+    if (timer) clearTimeout(timer);
+    this.receiptTimers.delete(itemId);
+    this.receiptChecks.delete(itemId);
+    this.receiptDeliveryIds.delete(itemId);
+  }
+
+  markDirectorProcessingStarted(deliveryId: string): void {
+    const receipt = this.db.prepare("SELECT item_id FROM director_inbox WHERE delivery_id=?").get(deliveryId) as any;
+    transaction(this.db, () => {
+      const item = this.db.prepare("SELECT * FROM director_inbox WHERE delivery_id=? AND state IN('submitting','submitted')").get(deliveryId) as any;
+      if (!item) return;
+      this.db.prepare("UPDATE director_inbox SET state='active' WHERE item_id=? AND state IN('submitting','submitted')").run(item.item_id);
+      this.db.prepare("UPDATE director_slots SET phase='active' WHERE item_id=? AND phase IN('submitting','submitted')").run(item.item_id);
+      this.db.prepare("UPDATE ends SET state='active' WHERE runtime_id=? AND state IN('submitting','submitted')").run(item.runtime_id);
+    });
+    if (receipt) this.clearReceiptCheck(receipt.item_id);
+  }
+
+  completeEndReview(sessionToken: string): { runtimeId: string } {
+    const caller = this.cells.caller(sessionToken);
+    invariant(caller.kind === "director" && caller.status === "active", "DIRECTOR_NOT_ACTIVE", "Caller is not active Director");
+    const completed = transaction(this.db, () => {
+      const item = this.db.prepare(`SELECT i.* FROM director_slots s JOIN director_inbox i ON i.item_id=s.item_id
+        WHERE s.run_id=? AND i.target_provider_session_id=?
+          AND s.phase IN('submitting','submitted','active') AND i.state IN('submitting','submitted','active')`).get(caller.run_id, caller.provider_session_id) as any;
+      invariant(item, "NO_ACTIVE_END", "Director has no active End");
+      // This matching review call confirms processing even if the provider callback was delayed.
+      this.db.prepare("UPDATE director_inbox SET state='active' WHERE item_id=? AND state IN('submitting','submitted')").run(item.item_id);
+      this.db.prepare("UPDATE director_slots SET phase='active' WHERE item_id=? AND phase IN('submitting','submitted')").run(item.item_id);
+      this.db.prepare("UPDATE ends SET state='active' WHERE runtime_id=? AND state IN('submitting','submitted')").run(item.runtime_id);
+      this.db.prepare("UPDATE director_inbox SET state='completed' WHERE item_id=?").run(item.item_id);
+      this.db.prepare("UPDATE ends SET state='completed',completed_at=? WHERE runtime_id=?").run(Date.now(), item.runtime_id);
+      this.db.prepare("DELETE FROM director_slots WHERE run_id=?").run(caller.run_id);
+      return { runtimeId: item.runtime_id, itemId: item.item_id };
+    });
+    this.clearReceiptCheck(completed.itemId);
+    return { runtimeId: completed.runtimeId };
+  }
+
+  releaseDirectorRun(runId: string): void {
+    transaction(this.db, () => {
+      const rows = this.db.prepare("SELECT item_id,runtime_id FROM director_inbox WHERE target_run_id=? AND state IN('submitting','submitted','active')").all(runId) as any[];
+      this.db.prepare("DELETE FROM director_slots WHERE run_id=?").run(runId);
+      for (const row of rows) {
+        this.clearReceiptCheck(row.item_id);
+        this.db.prepare("UPDATE director_inbox SET state='pending',target_run_id=NULL,target_provider_session_id=NULL,last_error='Director session ended' WHERE item_id=?").run(row.item_id);
+        this.db.prepare("UPDATE ends SET state='director_pending' WHERE runtime_id=? AND state IN('submitting','submitted','active')").run(row.runtime_id);
+      }
+    });
+  }
+
+  async archive(runtimeId: string): Promise<void> {
+    const runtime = this.db.prepare("SELECT * FROM runtimes WHERE runtime_id=?").get(runtimeId) as any;
+    if (!runtime || (runtime.archive_state === "fixed" && runtime.cleanup_state === "complete")) return;
+    const dir = this.runtimeDirectory(runtime), snapshotName = `snapshot-${runtime.runtime_no}`;
+    const snapshot = resolve(dir, snapshotName);
+    const attempts: Array<Record<string, unknown>> = [];
+    const temporary = resolve(dir, `${snapshotName}.tar.zst.${randomUUID()}.tmp`), final = resolve(dir, `${snapshotName}.tar.zst`);
+    const cleanup = () => {
+      try {
+        invariant(existsSync(final), "ARCHIVE_MISSING", "Fixed archive is missing; preserve Snapshot");
+        const check = spawnSync("tar", ["-tf", final], { encoding: "utf8", windowsHide: true });
+        invariant(check.status === 0 && check.stdout.split(/\r?\n/).some(name => name === `${snapshotName}/` || name === snapshotName), "ARCHIVE_INVALID", "Fixed archive is unreadable or has the wrong Snapshot root; preserve Snapshot");
+        this.removeSnapshot(snapshot);
+        transaction(this.db, () => this.db.prepare("UPDATE runtimes SET cleanup_state='complete',archive_diagnostics_json=NULL WHERE runtime_id=?").run(runtimeId));
+      } catch (cleanupError) {
+        transaction(this.db, () => this.db.prepare("UPDATE runtimes SET cleanup_state='failed',archive_diagnostics_json=? WHERE runtime_id=?").run(json({ stage: "cleanup", error: String(cleanupError), recordedAt: Date.now() }), runtimeId));
+        this.log.write("snapshot_cleanup_failed", { runtimeId, error: String(cleanupError) });
+      }
+    };
+    if (runtime.archive_state === "fixed") { cleanup(); return; }
+    if (!existsSync(snapshot)) return;
+    try { transaction(this.db, () => this.db.prepare("UPDATE runtimes SET archive_state='archiving',archive_diagnostics_json=NULL WHERE runtime_id=?").run(runtimeId)); }
+    catch (error) { this.log.write("snapshot_archive_state_failed", { runtimeId, error: String(error) }); return; }
+    for (let attempt=1; attempt<=3; attempt++) {
+      try {
+        if (existsSync(temporary)) rmSync(temporary, { force: true });
+        const result = spawnSync("tar", ["-caf", temporary, "-C", dir, snapshotName], { windowsHide: true });
+        if (result.status !== 0 || !existsSync(temporary)) throw new Error(`tar failed: status=${result.status}; ${result.stderr?.toString() ?? ""}`);
+        renameSync(temporary, final);
+        transaction(this.db, () => this.db.prepare("UPDATE runtimes SET archive_state='fixed' WHERE runtime_id=?").run(runtimeId));
+        cleanup();
+        this.log.write("snapshot_archived", { runtimeId, final }); return;
+      } catch (error) {
+        attempts.push({ attempt, at: Date.now(), error: String(error) });
+        rmSync(temporary, { force: true });
+        const latest = this.db.prepare("SELECT archive_state FROM runtimes WHERE runtime_id=?").get(runtimeId) as any;
+        if (latest?.archive_state === "fixed") { cleanup(); return; }
+      }
+    }
+    try { transaction(this.db, () => this.db.prepare("UPDATE runtimes SET archive_state='failed',archive_diagnostics_json=? WHERE runtime_id=? AND archive_state!='fixed'").run(json({ stage: "archive", attempts, temporary, final, snapshot, recordedAt: Date.now() }), runtimeId)); }
+    catch (error) { this.log.write("snapshot_archive_diagnostics_failed", { runtimeId, error: String(error), attempts }); return; }
+    this.log.write("snapshot_archive_failed", { runtimeId, attempts });
+  }
+
+  recoverFilesystemResults(): number {
+    const rows = this.db.prepare("SELECT * FROM runtimes WHERE state IN('launching','running')").all() as any[];
+    let count = 0;
+    for (const runtime of rows) if (this.recoverOneFilesystemResult(runtime)) count++;
+    return count;
+  }
+
+  reconcileWorkerCompletions(): void {
+    const starts = this.db.prepare("SELECT start_id FROM starts WHERE state='completed'").all() as any[];
+    for (const row of starts) this.cells.completeItemBySource("start", row.start_id);
+    const contexts = this.db.prepare("SELECT context_id FROM result_contexts WHERE state='consumed'").all() as any[];
+    for (const row of contexts) this.cells.completeItemBySource("result", row.context_id);
+  }
+
+  private recoverCreatedSnapshots(): number {
+    const rows = this.db.prepare(`SELECT r.*,s.start_id FROM runtimes r JOIN starts s ON s.runtime_id=r.runtime_id
+      WHERE r.state='created' AND r.snapshot_state IN('none','commit_pending')`).all() as any[];
+    let recovered = 0;
+    for (const runtime of rows) {
+      const runtimeDir = this.runtimeDirectory(runtime);
+      const snapshot = resolve(runtimeDir, `snapshot-${runtime.runtime_no}`);
+      if (!existsSync(snapshot)) continue;
+      try {
+        if (runtime.snapshot_state === "commit_pending") {
+          const actual = this.treeManifest(snapshot);
+          const saved = runtime.snapshot_diagnostics_json ? parseJson<any>(runtime.snapshot_diagnostics_json).manifest : undefined;
+          // Freezing removes write permissions; directory sizes can change during a copy.
+          const contents = (entries: Array<Record<string, unknown>>) => json(entries.map(entry => ({ path: entry.path, type: entry.type, sha256: entry.sha256, mode: Number(entry.mode) & ~0o222 })));
+          let matches = actual.hash === runtime.snapshot_source_hash;
+          if (saved) matches = contents(actual.entries) === contents(saved.entries);
+          else if (!matches && runtime.snapshot_source_path && existsSync(runtime.snapshot_source_path)) {
+            const source = this.treeManifest(runtime.snapshot_source_path);
+            matches = source.hash === runtime.snapshot_source_hash && contents(actual.entries) === contents(source.entries);
+          }
+          invariant(matches, "SNAPSHOT_RECOVERY_MISMATCH", "Committed Snapshot does not match its recorded source");
+        }
+        this.validateModelingOutput(snapshot);
+        this.freezeSnapshot(snapshot);
+      } catch (error) {
+        this.removeSnapshot(snapshot);
+        this.db.prepare("UPDATE runtimes SET snapshot_state='none' WHERE runtime_id=? AND state='created'").run(runtime.runtime_id);
+        this.log.write("orphan_snapshot_rejected", { runtimeId: runtime.runtime_id, error: String(error) });
+        continue;
+      }
+      if (this.cells.workerItemState("start", runtime.start_id) !== "active") {
+        this.removeSnapshot(snapshot);
+        this.log.write("stale_snapshot_discarded", { runtimeId: runtime.runtime_id });
+        continue;
+      }
+      const executorToken = randomUUID();
+      const adopted = this.cells.withRecoverableWorkerItem(runtime.cell_no, "start", runtime.start_id, () => transaction(this.db, () => {
+        const changed = this.db.prepare("UPDATE runtimes SET state='launching',snapshot_state='fixed',executor_token=?,snapshot_failure_class=NULL,snapshot_diagnostics_json=NULL,state_version=state_version+1 WHERE runtime_id=? AND state='created' AND snapshot_state IN('none','commit_pending')").run(executorToken, runtime.runtime_id);
+        if (changed.changes !== 1) return false;
+        this.db.prepare("UPDATE starts SET state='completed' WHERE start_id=? AND state='inbox_registered'").run(runtime.start_id);
+        return true;
+      }));
+      if (adopted === true) {
+        if (runtime.snapshot_temporary_path && existsSync(runtime.snapshot_temporary_path)) {
+          this.removeSnapshot(runtime.snapshot_temporary_path);
+        }
+        this.cells.completeItemBySource("start", runtime.start_id);
+        this.log.write("snapshot_recovered", { runtimeId: runtime.runtime_id });
+        recovered++;
+      } else {
+        const current = this.db.prepare("SELECT state FROM runtimes WHERE runtime_id=?").get(runtime.runtime_id) as any;
+        if (current?.state === "created" && existsSync(snapshot)) { this.removeSnapshot(snapshot); }
+      }
+    }
+    return recovered;
+  }
+
+  private reconcileDirectorOwnership(): void {
+    const rows = this.db.prepare("SELECT DISTINCT target_run_id FROM director_inbox WHERE target_run_id IS NOT NULL AND state IN('submitting','submitted','active')").all() as any[];
+    for (const row of rows) if (this.cells.directorRunStatus(row.target_run_id) !== "active") this.releaseDirectorRun(row.target_run_id);
+    const slots = this.db.prepare("SELECT DISTINCT run_id FROM director_slots").all() as any[];
+    for (const row of slots) if (this.cells.directorRunStatus(row.run_id) !== "active") this.releaseDirectorRun(row.run_id);
+  }
+
+  async recover(): Promise<void> {
+    this.reconcileDirectorOwnership();
+    this.recoverCreatedSnapshots();
+    this.recoverFilesystemResults();
+    const launching = this.db.prepare("SELECT runtime_id,executor_token FROM runtimes WHERE state='launching'").all() as any[];
+    for (const row of launching) {
+      try { await this.completeModelingRuntime(row.runtime_id); }
+      catch (error) { this.log.write("modeling_recovery_failed", { runtimeId: row.runtime_id, error: String(error) }); }
+    }
+    this.reconcileWorkerCompletions();
+    this.drainWorkerDispatch();
+    for (const cellNo of this.cells.currentBoundCellNumbers()) {
+      try { await this.cells.dispatchNextForCell(cellNo); }
+      catch (error) { this.log.write("worker_delivery_recovery_failed", { cellNo, error: String(error) }); }
+    }
+    try { await this.dispatchNextDirector(); }
+    catch (error) { this.log.write("director_delivery_recovery_failed", { error: String(error) }); }
+    const archives = this.db.prepare("SELECT runtime_id FROM runtimes WHERE state='finished' AND (archive_state IN('pending','archiving') OR (archive_state='fixed' AND cleanup_state!='complete'))").all() as any[];
+    for (const row of archives) { try { await this.archive(row.runtime_id); } catch (error) { this.log.write("snapshot_archive_recovery_isolated", { runtimeId: row.runtime_id, error: String(error) }); } }
+  }
+
+  close(): void {
+    this.closed = true;
+    for (const timer of this.deliveryRetryTimers.values()) clearTimeout(timer);
+    for (const timer of this.receiptTimers.values()) clearTimeout(timer);
+    this.deliveryRetryTimers.clear();
+    this.receiptTimers.clear();
+    this.db.close();
+  }
+}

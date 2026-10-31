@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Modeling SIDMAH Work Place result",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "primaryModel",
+    "previewImages",
+    "otherFiles"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": 1
+    },
+    "primaryModel": {
+      "type": "string",
+      "minLength": 1
+    },
+    "previewImages": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "uniqueItems": true
+    },
+    "otherFiles": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "uniqueItems": true
+    },
+    "notes": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false
+}
