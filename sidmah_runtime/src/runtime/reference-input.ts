@@ -84,7 +84,7 @@ export function registerReferenceImage(projectRoot:string,args:{sourcePath?:stri
     if(temp) {
       // Validate against the actual format even though this is a temporary file.
       const correct=resolve(inbox,`.${randomUUID()}${extension}`);
-      renameSync(temp,correct);temp=correct;
+      renameSync(temp,correct);temp=correct;source=correct;
       assertImage(correct);
     }
     copyFileSync(source,destination);
