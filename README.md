@@ -39,9 +39,11 @@ Tripo公式Skills：[Tripo3D-Plugin-dsh](https://github.com/Tripo-Developer/Trip
 
 Blenderで正面・側面・背面の固定視点をレンダリングし、参照画像と半透明で重ねる補助ツールを収録しています。
 
-`blender -b --python scripts/blender_render_views.py -- --input works/cell_1/work_place/model.glb --output renders`
+`blender -b --python scripts/blender_render_views.py -- --input works/cell_1/work_place/model.glb --output renders --ortho-scale 2.5 --camera-center 0 0 1`
 
 `python scripts/overlay_compare.py --reference modeling/reference_images/whole/front.png --render renders/front.png --output comparisons/front.png`
+
+モデル同士の寸法比較では、Directorが対象に合う値を決めたうえで **同じ `--ortho-scale` と `--camera-center`** を使用します（上の数値は書式例）。省略した場合はプレビュー用の自動フレーミングとなるため、寸法比較には使いません。
 
 `scripts/overlay_compare.py`は検査用画像を生成するだけです。完全一致を機械的に判定するものではありません。部位単位と統合した全体像の両方をDirectorが評価します。
 
