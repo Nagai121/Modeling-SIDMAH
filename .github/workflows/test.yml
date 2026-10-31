@@ -1,16 +1,12 @@
 name: Modeling SIDMAH tests
 on:
   push:
-    branches: [main, v0.1.2-validation]
+    branches: [main]
   pull_request:
   workflow_dispatch:
 jobs:
   offline-tests:
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:

@@ -225,7 +225,7 @@ export class RuntimeManager {
     const item = this.cells.claimWorkerItemForMcpCall(sessionToken, "start");
     const startId = item.source_id;
     const start = this.db.prepare("SELECT * FROM starts WHERE start_id=?").get(startId) as any;
-    invariant(start && start.state === "inbox_registered", "START_NOT_ACTIVE", "Start is not ready for Starter");
+    invariant(start && start.state === "inbox_registered", "START_NOT_ACTIVE", "Start is not ready for Worker submission");
     const binding = this.cells.validateWorker(start.cell_no, sessionToken);
     const runtime = this.db.prepare("SELECT * FROM runtimes WHERE runtime_id=?").get(start.runtime_id) as any;
     invariant(runtime?.state === "created", "RUNTIME_START_CONFLICT", "Runtime is not in created state");
