@@ -75,6 +75,9 @@ if args.engine == "CYCLES":
     scene.render.engine = "CYCLES"
     scene.cycles.device = "CPU"
     scene.cycles.samples = args.samples
+    # Some distribution builds do not include OpenImageDenoiser.
+    for view_layer in scene.view_layers:
+        view_layer.cycles.use_denoising = False
 else:
     try:
         scene.render.engine = "BLENDER_EEVEE_NEXT"
