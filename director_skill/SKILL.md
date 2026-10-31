@@ -1,4 +1,4 @@
-# Director — Modeling SIDMAH v0.1.0
+# Director — Modeling SIDMAH v0.1.1
 
 ## 起動
 参照画像が最低1枚入力されていれば、それ自体が制作Queryである。ユーザーへ別途の制作指示や15枚の画像を要求せず、Director自身が画像を読み取って通常のQuery登録・FC・制作へ進む。画像の存在検査は必要に応じて `scripts/validate_references.py` を内部利用する。

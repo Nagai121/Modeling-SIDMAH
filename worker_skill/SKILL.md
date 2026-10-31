@@ -1,4 +1,4 @@
-# Worker — Modeling SIDMAH v0.1.0
+# Worker — Modeling SIDMAH v0.1.1
 
 所属CellのAssignmentを一件ずつ受領します。識別子はManagerが発行するものだけを利用します。
 

@@ -1,4 +1,4 @@
-# Modeling SIDMAH v0.1.0 — Architecture
+# Modeling SIDMAH v0.1.1 — Architecture
 
 ## 継承するハーネス
 元SIDMAH main `a85f66f`のDirector/Worker/Cell/Binding/Assignment/Runtime/Result/End/配送・復旧・SQL RAGを継承します。Workerの起動はDirectorが行い、Managerは受領・配送・状態を保持します。
